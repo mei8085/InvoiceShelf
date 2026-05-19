@@ -196,7 +196,239 @@ public function getInvoiceTemplateName()
 
 ---
 
-## 7. 重复转换可达性深度分析
+## 7. 条目税费级联删除风险分析
+
+### 7.1 税费表外键约束
+
+[2019_09_21_052548_create_taxes_table.php:18-25](database/migrations/2019_09_21_052548_create_taxes_table.php#L18-L25)
+
+| 外键字段 | 关联表 | 级联删除 |
+|---------|-------|---------|
+| `invoice_id` | invoices | `ON DELETE CASCADE` |
+| `estimate_id` | estimates | `ON DELETE CASCADE` |
+| `invoice_item_id` | invoice_items | `ON DELETE CASCADE` |
+| `estimate_item_id` | estimate_items | `ON DELETE CASCADE` |
+
+**关键**: 四个外键全部设置为级联删除，只要任一关联记录被删除，税费记录也会被删除。
+
+---
+
+### 7.2 转换过程中的税费复制逻辑
+
+#### 7.2.1 报价单级税费（正确处理）
+
+[ConvertEstimateController.php:115-125](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L115-L125)
+
+```php
+foreach ($estimate->taxes->toArray() as $tax) {
+    $tax['company_id'] = $request->header('company');
+    $tax['exchange_rate'] = $exchange_rate;
+    $tax['base_amount'] = $tax['amount'] * $exchange_rate;
+    $tax['currency_id'] = $estimate->currency_id;
+    unset($tax['estimate_id']);  // ✅ 显式移除 estimate_id
+    $invoice->taxes()->create($tax);
+}
+```
+
+**状态**: ✅ **安全** - `estimate_id` 被显式移除，不会触发级联删除。
+
+---
+
+#### 7.2.2 条目级税费（存在严重缺陷）
+
+[ConvertEstimateController.php:104-112](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L104-L112)
+
+```php
+foreach ($invoiceItems as $invoiceItem) {
+    // $invoiceItem 来自 $estimate->items->toArray()
+    // 包含所有字段，包括 estimate_item_id
+    
+    $item = $invoice->items()->create($invoiceItem);  // 创建新的 InvoiceItem
+    
+    if (array_key_exists('taxes', $invoiceItem) && $invoiceItem['taxes']) {
+        foreach ($invoiceItem['taxes'] as $tax) {
+            $tax['company_id'] = $request->header('company');
+            if ($tax['amount']) {
+                // ❌ $tax 包含 estimate_item_id，未被移除！
+                // ❌ 通过 $item->taxes()->create() 会自动设置 invoice_item_id
+                $item->taxes()->create($tax);
+            }
+        }
+    }
+}
+```
+
+**关键问题**:
+1. `$invoiceItem['taxes']` 通过 `toArray()` 包含原始的 `estimate_item_id`
+2. 代码**没有** `unset($tax['estimate_item_id'])`
+3. `$item->taxes()->create($tax)` 会自动设置 `invoice_item_id` 为新创建的发票条目ID
+
+**结果**: 新创建的税费记录同时包含 **`estimate_item_id`** 和 **`invoice_item_id`** 两个外键！
+
+---
+
+### 7.3 delete_estimate 配置下的级联删除后果
+
+**触发条件**:
+- 公司设置 `estimate_convert_action = 'delete_estimate'`
+- 转换成功后执行 `$estimate->delete()` 硬删除报价单
+
+**级联删除链**:
+```
+删除 Estimate
+    ↓
+ON DELETE CASCADE 触发
+    ↓
+删除所有关联的 EstimateItem
+    ↓
+每个 EstimateItem 删除时触发 ON DELETE CASCADE
+    ↓
+删除所有 estimate_item_id 匹配的 Tax 记录 🔥
+    ↓
+这些 Tax 记录同时属于 InvoiceItem！
+    ↓
+发票条目税费丢失，发票数据损坏
+```
+
+**受影响的数据**:
+| 对象 | 状态 | 说明 |
+|------|------|------|
+| 报价单 | ❌ 已删除 | 预期行为 |
+| 报价单条目 | ❌ 已删除 | 预期行为 |
+| 发票主记录 | ✅ 保留 | 独立存在 |
+| 发票条目 | ✅ 保留 | 独立存在 |
+| **发票条目税费** | ❌ **被误删** | 级联删除的受害者 |
+| 发票级税费 | ✅ 保留 | estimate_id 已被移除 |
+
+**数据不一致表现**:
+- 发票的 `tax` 字段（汇总税额）仍然正确
+- 但 `invoice_items.taxes` 关系返回空集合
+- PDF 预览时条目级税费不显示
+- 报表统计时税额明细缺失
+
+---
+
+### 7.4 修复方案
+
+**紧急修复**: 在条目税费复制时移除 `estimate_item_id`
+
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    unset($tax['estimate_item_id']);  // ✅ 新增这行
+    if ($tax['amount']) {
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+**建议同时移除**:
+- `unset($tax['id']);` - 避免 ID 冲突
+- `unset($tax['created_at']);`
+- `unset($tax['updated_at']);`
+
+---
+
+## 8. 字段补齐差异对比分析
+
+### 8.1 三条路径对比
+
+| 字段 | 报价单创建路径 | 发票常规创建路径 | 报价单转发票路径 |
+|-----|--------------|----------------|----------------|
+| **条目级税费** | | | |
+| `exchange_rate` | ❌ 不设置 | ✅ 设置 | ❌ 不设置 |
+| `base_amount` | ❌ 不设置 | ✅ 设置 | ❌ 不设置 |
+| `currency_id` | ❌ 不设置 | ✅ 设置 | ❌ 不设置 |
+| **单据级税费** | | | |
+| `exchange_rate` | ✅ 设置 | ✅ 设置 | ✅ 设置 |
+| `base_amount` | ✅ 设置 | ✅ 设置 | ✅ 设置 |
+| `currency_id` | ✅ 设置 | ✅ 设置 | ✅ 设置 |
+
+---
+
+### 8.2 各路径代码实现对比
+
+#### 8.2.1 发票常规创建路径（基准）
+
+[Invoice.php:518-532](app/Models/Invoice.php#L518-L532)
+
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $invoice->company_id;
+    $tax['exchange_rate'] = $invoice->exchange_rate;      // ✅
+    $tax['base_amount'] = $tax['amount'] * $exchange_rate; // ✅
+    $tax['currency_id'] = $invoice->currency_id;          // ✅
+    // ...
+    $item->taxes()->create($tax);
+}
+```
+
+#### 8.2.2 报价单创建路径
+
+[Estimate.php:326-332](app/Models/Estimate.php#L326-L332)
+
+```php
+foreach ($estimateItem['taxes'] as $tax) {
+    if (gettype($tax['amount']) !== 'NULL') {
+        $tax['company_id'] = $request->header('company');
+        // ❌ 缺少 exchange_rate, base_amount, currency_id
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+#### 8.2.3 报价单转发票路径
+
+[ConvertEstimateController.php:104-112](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L104-L112)
+
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    // ❌ 缺少 exchange_rate, base_amount, currency_id
+    if ($tax['amount']) {
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+---
+
+### 8.3 字段缺失的后果
+
+| 缺失字段 | 影响范围 | 严重程度 |
+|---------|---------|---------|
+| `exchange_rate` | 多货币报表、基准金额统计 | 🔴 高 |
+| `base_amount` | 以公司本位币统计的税费报表 | 🔴 高 |
+| `currency_id` | 货币格式显示、多货币分析 | 🟡 中 |
+
+**具体影响**:
+1. **多货币报表错误**: 使用 `base_amount` 统计的税费报表数据不完整
+2. **数据不一致**: 单据级税费有基准金额，条目级税费没有
+3. **审计困难**: 无法追溯税费的原始货币和汇率
+4. **PDF 显示**: 可能影响税费金额的货币格式显示
+
+---
+
+### 8.4 修复方案
+
+在 `ConvertEstimateController.php` 的条目税费循环中添加字段补齐：
+
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    $tax['exchange_rate'] = $exchange_rate;                // ✅ 新增
+    $tax['base_amount'] = $tax['amount'] * $exchange_rate; // ✅ 新增
+    $tax['currency_id'] = $estimate->currency_id;          // ✅ 新增
+    unset($tax['estimate_item_id']);                       // ✅ 新增（见 7.4）
+    if ($tax['amount']) {
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+---
+
+## 9. 重复转换可达性深度分析
 
 针对 `estimate_convert_action` 三种配置下的重复转换可达性分析：
 
@@ -217,7 +449,7 @@ public function getInvoiceTemplateName()
 
 ---
 
-### 7.2 配置二: `delete_estimate`（删除报价单）
+### 9.2 配置二: `delete_estimate`（删除报价单）
 
 **转换后行为**: 调用 `$this->delete()` 硬删除报价单。
 
@@ -262,7 +494,7 @@ public function getInvoiceTemplateName()
 
 ---
 
-### 7.4 重复转换可达性汇总表
+### 9.4 重复转换可达性汇总表
 
 | 配置 | 可达性 | 最大转换次数 | 风险等级 |
 |-----|--------|------------|---------|
@@ -272,9 +504,9 @@ public function getInvoiceTemplateName()
 
 ---
 
-## 8. 三类中途取消路径的实际数据结果
+## 10. 三类中途取消路径的实际数据结果
 
-### 8.1 路径一: 弹窗取消（前端确认阶段）
+### 10.1 路径一: 弹窗取消（前端确认阶段）
 
 **触发时机**: 用户点击"转换为发票"后，在确认对话框中点击"取消"。
 
@@ -303,7 +535,7 @@ dialogStore.openDialog({...})
 
 ---
 
-### 8.2 路径二: 写入中断（服务器执行阶段）
+### 10.2 路径二: 写入中断（服务器执行阶段）
 
 **触发时机**: 请求已发送到服务器，但在执行过程中发生异常（如数据库连接中断、PHP 致命错误、代码异常等）。
 
@@ -345,7 +577,7 @@ dialogStore.openDialog({...})
 
 ---
 
-### 8.3 路径三: 写入成功后取消（人工回滚阶段）
+### 10.3 路径三: 写入成功后取消（人工回滚阶段）
 
 **触发时机**: 转换完全成功后，用户发现错误，手动删除刚生成的发票。
 
@@ -402,7 +634,7 @@ public static function deleteInvoices($ids)
 
 ---
 
-### 8.4 三类取消路径对比表
+### 10.4 三类取消路径对比表
 
 | 取消路径 | 报价单状态 | 发票数据 | 数据一致性 | 可恢复性 |
 |---------|-----------|----------|-----------|---------|
@@ -414,23 +646,25 @@ public static function deleteInvoices($ids)
 
 ---
 
-## 9. 代码缺陷总结
+## 11. 代码缺陷总结
 
-| 位置 | 问题 | 影响 |
-|------|------|------|
-| ConvertEstimateController:96-100 | 变量名错误 `$estimateItem` 应为 `$invoiceItem` | 发票条目的基准金额字段为空 |
-| 缺少状态校验 | 任何状态的报价单都可转换 | 业务逻辑不严谨 |
-| 缺少重复转换检测 | 同一报价单可多次转换 | 数据冗余 |
-| 缺少数据库事务 | 出错时可能产生不完整数据 | 数据不一致 |
-| 缺少转换关联 | 无法追溯发票来源 | 审计困难 |
+| 位置 | 问题 | 影响 | 严重程度 |
+|------|------|------|---------|
+| ConvertEstimateController:104-112 | 条目级税费未移除 `estimate_item_id` | delete_estimate 配置下触发级联删除，丢失发票条目税费 | 🔴 致命 |
+| ConvertEstimateController:96-100 | 变量名错误 `$estimateItem` 应为 `$invoiceItem` | 发票条目的基准金额字段为空 | 🔴 高 |
+| ConvertEstimateController:104-112 | 条目级税费缺少 `exchange_rate`, `base_amount`, `currency_id` | 多货币报表统计错误 | 🔴 高 |
+| 缺少状态校验 | 任何状态的报价单都可转换 | 业务逻辑不严谨 | 🟡 中 |
+| 缺少重复转换检测 | 同一报价单可多次转换 | 数据冗余 | 🟡 中 |
+| 缺少数据库事务 | 出错时可能产生不完整数据 | 数据不一致 | 🟡 中 |
+| 缺少转换关联 | 无法追溯发票来源 | 审计困难 | 🟢 低 |
 
 ---
 
-## 10. 紧急修复建议
+## 12. 紧急修复建议
 
 针对本次分析发现的最高优先级问题：
 
-### 10.1 立即修复: 变量名错误（高优先级）
+### 12.1 立即修复: 变量名错误（高优先级）
 
 **位置**: [ConvertEstimateController.php:96-100](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L96-L100)
 
@@ -456,12 +690,60 @@ $invoiceItem['base_total'] = $invoiceItem['total'] * $exchange_rate;
 
 ---
 
-## 11. 建议改进
+### 12.2 立即修复: 条目级税费级联删除风险（致命）
+
+**位置**: [ConvertEstimateController.php:104-112](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L104-L112)
+
+**问题**: 条目级税费复制时未移除 `estimate_item_id`，导致新创建的税费记录同时关联原报价单条目和新发票条目。当 `estimate_convert_action = 'delete_estimate'` 时，删除报价单会触发级联删除，误删发票条目税费。
+
+**修复后代码**:
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    unset($tax['estimate_item_id']);  // ✅ 新增
+    unset($tax['id']);                 // ✅ 建议新增，避免ID冲突
+    if ($tax['amount']) {
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+**影响**: 在 `delete_estimate` 配置下，所有通过转换生成的发票条目税费都会在报价单删除时被级联删除，导致发票数据损坏。
+
+---
+
+### 12.3 立即修复: 条目级税费字段缺失（高优先级）
+
+**位置**: [ConvertEstimateController.php:104-112](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L104-L112)
+
+**问题**: 条目级税费复制时缺少 `exchange_rate`、`base_amount`、`currency_id` 字段，与发票常规创建路径不一致。
+
+**修复后代码**:
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    $tax['exchange_rate'] = $exchange_rate;                // ✅ 新增
+    $tax['base_amount'] = $tax['amount'] * $exchange_rate; // ✅ 新增
+    $tax['currency_id'] = $estimate->currency_id;          // ✅ 新增
+    unset($tax['estimate_item_id']);                       // ✅ 见 12.2
+    if ($tax['amount']) {
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+**影响**: 多货币报表统计错误，数据不一致。
+
+---
+
+## 13. 建议改进
 
 1. **添加状态校验**: 仅允许特定状态（如 SENT、VIEWED、ACCEPTED）的报价单转换
 2. **添加转换标记**: 在 `estimates` 表中添加 `converted_to_invoice_id` 字段记录转换关系
 3. **添加事务保护**: 使用 `DB::transaction()` 包裹整个转换过程
-4. **修复变量名错误**: 修正第 96-100 行的变量名（见 10.1）
-5. **添加重复转换检测**: 已转换的报价单不再显示转换按钮或拒绝转换请求
-6. **添加回滚机制**: 删除转换生成的发票时，根据配置恢复报价单状态
-7. **添加数据完整性校验**: 发票创建完成后验证条目数、税费金额与报价单一致
+4. **修复变量名错误**: 修正第 96-100 行的变量名（见 12.1）
+5. **修复条目级税费外键**: 移除 `estimate_item_id`（见 12.2）
+6. **修复条目级税费字段**: 补齐 `exchange_rate`、`base_amount`、`currency_id`（见 12.3）
+7. **添加重复转换检测**: 已转换的报价单不再显示转换按钮或拒绝转换请求
+8. **添加回滚机制**: 删除转换生成的发票时，根据配置恢复报价单状态
+9. **添加数据完整性校验**: 发票创建完成后验证条目数、税费金额与报价单一致
