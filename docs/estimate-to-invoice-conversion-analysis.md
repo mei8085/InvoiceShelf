@@ -196,7 +196,225 @@ public function getInvoiceTemplateName()
 
 ---
 
-## 7. 代码缺陷总结
+## 7. 重复转换可达性深度分析
+
+针对 `estimate_convert_action` 三种配置下的重复转换可达性分析：
+
+### 7.1 配置一: `no_action`（不操作）
+
+**转换后行为**: 报价单保持原样，不做任何修改。
+
+**重复转换可达性**: ✅ **完全可达**
+
+| 检查点 | 状态 | 说明 |
+|--------|------|------|
+| 报价单是否存在 | ✅ 存在 | 未被删除 |
+| 前端按钮是否显示 | ✅ 显示 | 无状态判断，始终显示 |
+| 后端是否允许 | ✅ 允许 | 无状态校验 |
+| 实际可转换次数 | 无限次 | 没有任何限制 |
+
+**风险**: 同一报价单可被反复转换，产生大量重复发票数据。
+
+---
+
+### 7.2 配置二: `delete_estimate`（删除报价单）
+
+**转换后行为**: 调用 `$this->delete()` 硬删除报价单。
+
+**关键事实**:
+- Estimate 模型**未使用** `SoftDeletes` trait
+- `deleted_at` 字段虽在 `$dates` 属性中，但不启用软删除
+- `delete()` 执行物理删除（`DELETE FROM`）
+- 路由模型绑定使用默认行为，找不到已删除记录
+
+**重复转换可达性**: ❌ **不可达**
+
+| 检查点 | 状态 | 说明 |
+|--------|------|------|
+| 报价单是否存在 | ❌ 不存在 | 已被物理删除 |
+| 前端列表是否显示 | ❌ 不显示 | 查询不包含已删除记录 |
+| API 是否可访问 | ❌ 404 | 路由模型绑定失败 |
+| 实际可转换次数 | 1 次 | 仅限首次转换 |
+
+**风险**: 报价单被永久删除，无法追溯原始数据。
+
+---
+
+### 7.3 配置三: `mark_estimate_as_accepted`（标记为已接受）
+
+**转换后行为**: 将报价单 `status` 字段设置为 `ACCEPTED`。
+
+**重复转换可达性**: ✅ **完全可达**
+
+| 检查点 | 状态 | 说明 |
+|--------|------|------|
+| 报价单是否存在 | ✅ 存在 | 仅修改状态 |
+| 前端按钮是否显示 | ✅ 显示 | 转换按钮无状态判断 |
+| 后端是否允许 | ✅ 允许 | ConvertEstimateController 无状态校验 |
+| 实际可转换次数 | 无限次 | ACCEPTED 状态不阻止转换 |
+
+**代码验证**:
+- 前端转换按钮显示条件: `userStore.hasAbilities(abilities.CREATE_INVOICE)` [EstimateIndexDropdown.vue:79](resources/scripts/admin/components/dropdowns/EstimateIndexDropdown.vue#L79)
+- 后端权限检查: `$this->authorize('create', Invoice::class)` [ConvertEstimateController.php:26](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L26)
+- **两处均未检查报价单状态**
+
+**风险**: 已接受的报价单可被反复转换为发票。
+
+---
+
+### 7.4 重复转换可达性汇总表
+
+| 配置 | 可达性 | 最大转换次数 | 风险等级 |
+|-----|--------|------------|---------|
+| `no_action` | ✅ 可达 | 无限次 | 🔴 高 |
+| `delete_estimate` | ❌ 不可达 | 1 次 | 🟡 中（数据丢失） |
+| `mark_estimate_as_accepted` | ✅ 可达 | 无限次 | 🔴 高 |
+
+---
+
+## 8. 三类中途取消路径的实际数据结果
+
+### 8.1 路径一: 弹窗取消（前端确认阶段）
+
+**触发时机**: 用户点击"转换为发票"后，在确认对话框中点击"取消"。
+
+**代码路径**:
+```javascript
+dialogStore.openDialog({...})
+  .then((res) => {
+    if (res) {  // 用户点击 OK
+      // 只有 res 为 true 才会发送请求
+      estimateStore.convertToInvoice(id)...
+    }
+    // res 为 false 时直接结束
+  })
+```
+[EstimateIndexDropdown.vue:228-248](resources/scripts/admin/components/dropdowns/EstimateIndexDropdown.vue#L228-L248)
+
+**数据结果**:
+| 对象 | 状态 | 说明 |
+|------|------|------|
+| HTTP 请求 | ❌ 未发送 | 无网络请求 |
+| 报价单 | ✅ 不变 | 无任何修改 |
+| 发票 | ✅ 不创建 | 无新数据 |
+| 事务回滚 | 不涉及 | 无数据库操作 |
+
+**结论**: 完全安全，无任何副作用。
+
+---
+
+### 8.2 路径二: 写入中断（服务器执行阶段）
+
+**触发时机**: 请求已发送到服务器，但在执行过程中发生异常（如数据库连接中断、PHP 致命错误、代码异常等）。
+
+**代码执行顺序** [ConvertEstimateController.php:24-132](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L24-L132):
+```
+1. 权限检查 ✅
+2. 加载报价单关联数据 ✅
+3. 计算到期日期 ✅
+4. 生成序列号 ✅
+5. 创建发票主记录 ⚠️ 可能在此之前中断
+6. 生成 unique_hash ✅
+7. 循环创建发票条目 ⚠️ 可能在此循环中中断
+   ├─ 创建条目
+   └─ 创建条目税费
+8. 循环创建发票税费 ⚠️ 可能在此循环中中断
+9. 执行报价单转换后动作（最后一步）⚠️
+```
+
+**关键缺陷**:
+- ❌ **无数据库事务保护**
+- ❌ **无 try-catch 异常处理**
+- ❌ **无任何回滚机制**
+
+**可能的数据结果场景**:
+
+| 中断点 | 发票主记录 | 发票条目 | 发票税费 | 报价单状态 | 数据一致性 |
+|--------|-----------|----------|----------|-----------|-----------|
+| 第5步之前 | ❌ 未创建 | - | - | ✅ 不变 | 一致 |
+| 第5步之后，第7步之前 | ✅ 已创建 | ❌ 未创建 | ❌ 未创建 | ✅ 不变 | ❌ 不一致 |
+| 第7步循环中 | ✅ 已创建 | ⚠️ 部分创建 | ⚠️ 部分创建 | ✅ 不变 | ❌ 不一致 |
+| 第7步之后，第8步之前 | ✅ 已创建 | ✅ 全部创建 | ❌ 未创建 | ✅ 不变 | ❌ 不一致 |
+| 第8步循环中 | ✅ 已创建 | ✅ 全部创建 | ⚠️ 部分创建 | ✅ 不变 | ❌ 不一致 |
+| 第9步执行中 | ✅ 已创建 | ✅ 全部创建 | ✅ 全部创建 | ⚠️ 取决于配置 | ⚠️ 可能不一致 |
+
+**最可能的脏数据**:
+- 孤儿发票（有主记录但无条目）
+- 不完整发票（部分条目缺失）
+- 税额不匹配（条目税费与汇总税费不一致）
+
+---
+
+### 8.3 路径三: 写入成功后取消（人工回滚阶段）
+
+**触发时机**: 转换完全成功后，用户发现错误，手动删除刚生成的发票。
+
+**代码路径**:
+1. 转换成功，发票已完整创建
+2. 用户在发票列表中删除该发票
+3. 调用 `Invoice::deleteInvoices($ids)` [Invoice.php:745-758](app/Models/Invoice.php#L745-L758)
+
+**删除发票时的行为**:
+```php
+public static function deleteInvoices($ids)
+{
+    foreach ($ids as $id) {
+        $invoice = self::find($id);
+        if ($invoice->transactions()->exists()) {
+            $invoice->transactions()->delete();
+        }
+        $invoice->delete();  // 硬删除
+    }
+}
+```
+
+**不同配置下的最终数据结果**:
+
+#### 场景 3.1: `no_action` 配置
+
+| 对象 | 最终状态 | 说明 |
+|------|---------|------|
+| 发票 | ❌ 已删除 | 被用户手动删除 |
+| 报价单 | ✅ 保持原样 | 转换时未修改 |
+| 可再次转换 | ✅ 是 | 报价单状态未变 |
+
+#### 场景 3.2: `delete_estimate` 配置
+
+| 对象 | 最终状态 | 说明 |
+|------|---------|------|
+| 发票 | ❌ 已删除 | 被用户手动删除 |
+| 报价单 | ❌ 已删除 | 转换时已被硬删除 |
+| 可再次转换 | ❌ 否 | 报价单已不存在 |
+| 数据追溯 | ❌ 完全丢失 | 两者均被删除，无法追溯 |
+
+**严重风险**: 转换后立即删除发票会导致**原始报价单数据永久丢失**，没有任何恢复途径。
+
+#### 场景 3.3: `mark_estimate_as_accepted` 配置
+
+| 对象 | 最终状态 | 说明 |
+|------|---------|------|
+| 发票 | ❌ 已删除 | 被用户手动删除 |
+| 报价单 | ✅ 存在，但状态为 ACCEPTED | 转换时被标记 |
+| 可再次转换 | ✅ 是 | 无状态校验阻止 |
+| 数据追溯 | ⚠️ 部分保留 | 报价单存在，但状态可能不准确 |
+
+**问题**: 报价单被标记为 ACCEPTED，但实际并未生成有效的发票，业务状态不一致。
+
+---
+
+### 8.4 三类取消路径对比表
+
+| 取消路径 | 报价单状态 | 发票数据 | 数据一致性 | 可恢复性 |
+|---------|-----------|----------|-----------|---------|
+| 弹窗取消 | ✅ 不变 | ✅ 不创建 | ✅ 完全一致 | - |
+| 写入中断 | ✅ 不变 | ⚠️ 部分创建 | ❌ 不一致 | ⚠️ 需手动清理 |
+| 写入成功后删除（no_action） | ✅ 不变 | ❌ 已删除 | ✅ 一致 | ✅ 可重新转换 |
+| 写入成功后删除（delete_estimate） | ❌ 已删除 | ❌ 已删除 | ✅ 一致 | ❌ 数据永久丢失 |
+| 写入成功后删除（mark_accepted） | ⚠️ ACCEPTED | ❌ 已删除 | ❌ 业务状态不一致 | ⚠️ 可转换但状态异常 |
+
+---
+
+## 9. 代码缺陷总结
 
 | 位置 | 问题 | 影响 |
 |------|------|------|
@@ -208,10 +426,42 @@ public function getInvoiceTemplateName()
 
 ---
 
-## 8. 建议改进
+## 10. 紧急修复建议
+
+针对本次分析发现的最高优先级问题：
+
+### 10.1 立即修复: 变量名错误（高优先级）
+
+**位置**: [ConvertEstimateController.php:96-100](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L96-L100)
+
+**问题代码**:
+```php
+$estimateItem['exchange_rate'] = $exchange_rate;        // ❌ 未定义变量
+$estimateItem['base_price'] = $invoiceItem['price'] * $exchange_rate;
+$estimateItem['base_discount_val'] = $invoiceItem['discount_val'] * $exchange_rate;
+$estimateItem['base_tax'] = $invoiceItem['tax'] * $exchange_rate;
+$estimateItem['base_total'] = $invoiceItem['total'] * $exchange_rate;
+```
+
+**修复后代码**:
+```php
+$invoiceItem['exchange_rate'] = $exchange_rate;
+$invoiceItem['base_price'] = $invoiceItem['price'] * $exchange_rate;
+$invoiceItem['base_discount_val'] = $invoiceItem['discount_val'] * $exchange_rate;
+$invoiceItem['base_tax'] = $invoiceItem['tax'] * $exchange_rate;
+$invoiceItem['base_total'] = $invoiceItem['total'] * $exchange_rate;
+```
+
+**影响**: 当前所有通过报价单转换生成的发票，其条目的基准金额字段（`exchange_rate`、`base_price`、`base_discount_val`、`base_tax`、`base_total`）均为空，可能影响多货币报表统计。
+
+---
+
+## 11. 建议改进
 
 1. **添加状态校验**: 仅允许特定状态（如 SENT、VIEWED、ACCEPTED）的报价单转换
 2. **添加转换标记**: 在 `estimates` 表中添加 `converted_to_invoice_id` 字段记录转换关系
 3. **添加事务保护**: 使用 `DB::transaction()` 包裹整个转换过程
-4. **修复变量名错误**: 修正第 96-100 行的变量名
+4. **修复变量名错误**: 修正第 96-100 行的变量名（见 10.1）
 5. **添加重复转换检测**: 已转换的报价单不再显示转换按钮或拒绝转换请求
+6. **添加回滚机制**: 删除转换生成的发票时，根据配置恢复报价单状态
+7. **添加数据完整性校验**: 发票创建完成后验证条目数、税费金额与报价单一致
