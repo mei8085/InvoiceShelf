@@ -504,9 +504,182 @@ foreach ($invoiceItem['taxes'] as $tax) {
 
 ---
 
-## 9. 税费金额判断逻辑差异分析
+## 9. 单据级税费深度行为分析
 
-### 9.1 两种判断方式对比
+### 9.1 数据库字段约束与类型转换
+
+**taxes 表关键字段约束** [2019_09_21_052548_create_taxes_table.php:31](database/migrations/2019_09_21_052548_create_taxes_table.php#L31):
+
+| 字段 | 类型 | 是否可空 | 说明 |
+|-----|------|---------|------|
+| `amount` | `bigInteger` | ❌ NOT NULL | 2024-02-08 从 unsigned 改为 signed |
+| `exchange_rate` | `decimal(19,6)` | ✅ NULLABLE | 2021-07-16 新增 |
+| `base_amount` | `unsignedBigInteger` | ✅ NULLABLE | 2021-07-16 新增 |
+| `currency_id` | `unsignedInteger` | ✅ NULLABLE | 2021-07-16 新增 |
+
+**模型类型转换** [Tax.php:22](app/Models/Tax.php#L22):
+```php
+'amount' => 'integer',  // 强制转换为 int
+```
+
+---
+
+### 9.2 `toArray()` 后的字段值分析
+
+当从数据库读取 Estimate 并调用 `->taxes->toArray()` 时，由于模型的 `casts` 定义：
+
+| 数据库原值 | Eloquent 读取后 | `toArray()` 后 |
+|-----------|---------------|--------------|
+| `NULL` | `null` | `null` |
+| `0` | `0` (int) | `0` (int) |
+| `100` | `100` (int) | `100` (int) |
+
+**关键结论**: 从数据库读取的税费记录，`amount` 字段**不可能为 `null`**，因为数据库字段是 NOT NULL 的。`null` 值只能出现在：
+1. 前端新创建但未保存的税费
+2. 手动构造的数组
+
+---
+
+### 9.3 两种输入场景的实际行为
+
+#### 场景 1: `amount = null`（仅可能来自报价单创建时的脏数据）
+
+**代码执行路径** [ConvertEstimateController.php:116-123](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L116-L123):
+```php
+foreach ($estimate->taxes->toArray() as $tax) {
+    $tax['company_id'] = $request->header('company');
+    $tax['exchange_rate'] = $exchange_rate;
+    $tax['base_amount'] = $tax['amount'] * $exchange_rate;  // null * 1.0 = 0
+    $tax['currency_id'] = $estimate->currency_id;
+    unset($tax['estimate_id']);
+    
+    $invoice->taxes()->create($tax);  // 无判断，无条件创建
+}
+```
+
+**PHP 类型强制转换**:
+- `null * 1.0` → `0`（PHP 弱类型转换）
+- 因此 `$tax['base_amount'] = 0`
+
+**实际写入结果**: ✅ **成功入库**
+
+| 字段 | 写入值 | 说明 |
+|-----|--------|------|
+| `amount` | `0` | 模型 casts 自动将 null 转为 0 |
+| `exchange_rate` | `$exchange_rate` | 正确设置 |
+| `base_amount` | `0` | null * rate = 0 |
+| `currency_id` | `$estimate->currency_id` | 正确设置 |
+
+**后果**: 静默创建了一条税额为 0 的税费记录，业务含义不明确。
+
+---
+
+#### 场景 2: `amount = 0`（合法的免税/零税率场景）
+
+**代码执行路径**:
+```php
+$tax['base_amount'] = 0 * $exchange_rate;  // = 0
+$invoice->taxes()->create($tax);  // 无判断
+```
+
+**实际写入结果**: ✅ **成功入库**
+
+| 字段 | 写入值 | 说明 |
+|-----|--------|------|
+| `amount` | `0` | 正确写入 |
+| `exchange_rate` | `$exchange_rate` | 正确设置 |
+| `base_amount` | `0` | 正确计算 |
+| `currency_id` | `$estimate->currency_id` | 正确设置 |
+
+**后果**: 这是正确的行为，免税记录应该被保留。
+
+---
+
+### 9.4 与常规建单路径的对比
+
+| 路径 | 单据级税费判断 | 行为 |
+|-----|---------------|------|
+| 报价单创建 | `if (gettype($tax['amount']) !== 'NULL')` | 仅排除 null，0 值保留 |
+| 发票创建 | `if (gettype($tax['amount']) !== 'NULL')` | 仅排除 null，0 值保留 |
+| 报价单转发票 | **无判断** | null 和 0 均无条件创建 |
+
+**不一致性**:
+- 报价单/发票创建路径：`amount = null` → 跳过
+- 转换路径：`amount = null` → 创建（amount 转为 0）
+
+---
+
+### 9.5 无事务保护下的半成品数据场景
+
+**完整执行顺序**（无事务包裹）:
+```
+1. Invoice::create([...])               → 发票主记录
+2. $invoice->save()                      → 设置 unique_hash
+3. foreach (items):                      → 循环创建条目
+   ├─ $invoice->items()->create()        → 创建 InvoiceItem
+   └─ foreach (taxes):
+      └─ $item->taxes()->create()        → 创建条目级税费
+4. foreach (estimate->taxes):            → 循环创建单据级税费
+   └─ $invoice->taxes()->create()        → 创建单据级税费
+5. $estimate->checkForEstimateConvertAction()  → 执行配置动作
+   └─ 可能: $estimate->delete()          → 删除报价单
+6. Invoice::find($id)                    → 重新读取
+```
+
+**可能的半成品数据场景**:
+
+| 中断点 | 发票主记录 | 发票条目 | 条目级税费 | 单据级税费 | 报价单 | 数据状态 |
+|--------|-----------|----------|-----------|-----------|--------|---------|
+| 第 1 步前 | ❌ 未创建 | - | - | - | ✅ 不变 | 干净 |
+| 第 2 步后 | ✅ 已创建 | ❌ 未创建 | ❌ 未创建 | ❌ 未创建 | ✅ 不变 | ❌ 孤儿发票 |
+| 第 3 步循环中 | ✅ 已创建 | ⚠️ 部分创建 | ⚠️ 部分创建 | ❌ 未创建 | ✅ 不变 | ❌ 不完整 |
+| 第 3 步后 | ✅ 已创建 | ✅ 全部创建 | ✅ 全部创建 | ❌ 未创建 | ✅ 不变 | ❌ 税额缺失 |
+| 第 4 步循环中 | ✅ 已创建 | ✅ 全部创建 | ✅ 全部创建 | ⚠️ 部分创建 | ✅ 不变 | ❌ 税额不完整 |
+| 第 5 步执行中 | ✅ 已创建 | ✅ 全部创建 | ✅ 全部创建 | ✅ 全部创建 | ⚠️ 可能已删除 | ⚠️ 取决于配置 |
+
+**最严重的半成品**: 第 5 步删除报价单时失败
+- 发票已完整创建
+- 报价单可能已被删除（如果 `delete()` 执行了但后续逻辑失败）
+- 或报价单未删除但状态已改变
+- 无法回滚已创建的发票数据
+
+---
+
+### 9.6 修复方案
+
+#### 9.6.1 增加判断逻辑
+
+与常规建单路径保持一致：
+
+```php
+if ($estimate->taxes) {
+    foreach ($estimate->taxes->toArray() as $tax) {
+        if (gettype($tax['amount']) !== 'NULL') {  // ✅ 新增判断
+            $tax['company_id'] = $request->header('company');
+            $tax['exchange_rate'] = $exchange_rate;
+            $tax['base_amount'] = $tax['amount'] * $exchange_rate;
+            $tax['currency_id'] = $estimate->currency_id;
+            unset($tax['estimate_id']);
+            
+            $invoice->taxes()->create($tax);
+        }
+    }
+}
+```
+
+#### 9.6.2 添加数据库事务
+
+```php
+DB::transaction(function () use ($estimate, $invoice_date, $due_date, $serial, $templateName, $exchange_rate, $request) {
+    // 所有写入操作放在事务内
+});
+```
+
+---
+
+## 10. 税费金额判断逻辑差异分析
+
+### 10.1 两种判断方式对比
 
 | 判断方式 | 代码位置 | 含义 |
 |---------|---------|------|
@@ -527,7 +700,7 @@ foreach ($invoiceItem['taxes'] as $tax) {
 
 ---
 
-### 9.2 TaxStub 与前端数据传递
+### 10.2 TaxStub 与前端数据传递
 
 **TaxStub 定义** [tax.js:1-8](resources/scripts/admin/stub/tax.js):
 ```javascript
@@ -566,9 +739,9 @@ function onSelectTax(selectedTax) {
 
 ---
 
-### 9.3 转换路径中的税费筛选问题
+### 10.3 转换路径中的税费筛选问题
 
-#### 9.3.1 条目级税费（有问题）
+#### 10.3.1 条目级税费（有问题）
 
 [ConvertEstimateController.php:104-112](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L104-L112)
 
@@ -585,7 +758,7 @@ foreach ($invoiceItem['taxes'] as $tax) {
 
 ---
 
-#### 9.3.2 单据级税费（无判断，更严重）
+#### 10.3.2 单据级税费（无判断，更严重）
 
 [ConvertEstimateController.php:115-125](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L115-L125)
 
@@ -604,7 +777,7 @@ if ($estimate->taxes) {
 
 ---
 
-### 9.4 对固定税场景的影响
+### 10.4 对固定税场景的影响
 
 **固定税配置**:
 - 税种设置为 `calculation_type = 'fixed'`
@@ -624,7 +797,7 @@ if ($estimate->taxes) {
 
 ---
 
-### 9.5 对边界税额场景的影响
+### 10.5 对边界税额场景的影响
 
 **边界场景 1: 极小金额四舍五入为 0**
 ```
@@ -647,7 +820,7 @@ if ($estimate->taxes) {
 
 ---
 
-### 9.6 修复方案
+### 10.6 修复方案
 
 统一使用 `gettype($tax['amount']) !== 'NULL'` 判断，与常规建单路径保持一致：
 
