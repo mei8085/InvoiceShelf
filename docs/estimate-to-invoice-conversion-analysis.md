@@ -504,6 +504,191 @@ foreach ($invoiceItem['taxes'] as $tax) {
 
 ---
 
+## 9. 税费金额判断逻辑差异分析
+
+### 9.1 两种判断方式对比
+
+| 判断方式 | 代码位置 | 含义 |
+|---------|---------|------|
+| `if ($tax['amount'])` | ConvertEstimateController:108 | PHP 弱类型判断，`0`、`''`、`null`、`false` 均为 false |
+| `if (gettype($tax['amount']) !== 'NULL')` | Invoice.php:525, Estimate.php:328 | 仅排除 `null` 值 |
+
+**真值表**:
+
+| `$tax['amount']` | `if ($tax['amount'])` | `gettype() !== 'NULL'` |
+|-----------------|----------------------|----------------------|
+| `null` | ❌ false | ❌ false |
+| `0` | ❌ false | ✅ true |
+| `1` | ✅ true | ✅ true |
+| `''` (空字符串) | ❌ false | ✅ true |
+| `'0'` | ❌ false | ✅ true |
+
+**关键差异**: `amount = 0` 时，转换路径会跳过该税费，而常规建单路径会保留。
+
+---
+
+### 9.2 TaxStub 与前端数据传递
+
+**TaxStub 定义** [tax.js:1-8](resources/scripts/admin/stub/tax.js):
+```javascript
+export default {
+  name: '',
+  tax_type_id: 0,
+  type: 'GENERAL',
+  amount: null,  // 初始值为 null
+  percent: null,
+  compound_tax: false,
+}
+```
+
+**前端税费计算逻辑** [CreateTotal.vue:359-378](resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue#L359-L378):
+```javascript
+function onSelectTax(selectedTax) {
+  let amount = 0
+  if (selectedTax.calculation_type === 'percentage') {
+    amount = Math.round(...)  // 基于百分比计算
+  } else if (selectedTax.calculation_type === 'fixed') {
+    amount = selectedTax.fixed_amount  // 固定税直接使用
+  }
+
+  let data = {
+    ...TaxStub,
+    amount,  // 覆盖为计算后的值
+    // ...
+  }
+}
+```
+
+**可能产生 `amount = 0` 的场景**:
+1. **百分比税**: 当 `getSubtotalWithDiscount = 0` 时（如免费条目），计算结果为 `0`
+2. **固定税**: 当 `fixed_amount = 0` 时（免税税种）
+3. **四舍五入**: 极小金额四舍五入后为 `0`
+
+---
+
+### 9.3 转换路径中的税费筛选问题
+
+#### 9.3.1 条目级税费（有问题）
+
+[ConvertEstimateController.php:104-112](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L104-L112)
+
+```php
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    if ($tax['amount']) {  // ❌ 0 值被过滤
+        $item->taxes()->create($tax);
+    }
+}
+```
+
+**问题**: `amount = 0` 的税费被静默丢弃。
+
+---
+
+#### 9.3.2 单据级税费（无判断，更严重）
+
+[ConvertEstimateController.php:115-125](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L115-L125)
+
+```php
+if ($estimate->taxes) {
+    foreach ($estimate->taxes->toArray() as $tax) {
+        // ... 字段设置
+        $invoice->taxes()->create($tax);  // ⚠️ 无任何判断，全部创建
+    }
+}
+```
+
+**问题**: 即使 `amount = 0` 或 `amount = null`，也会无条件创建税费记录。
+
+**不一致性**: 条目级税费和单据级税费使用不同的筛选逻辑！
+
+---
+
+### 9.4 对固定税场景的影响
+
+**固定税配置**:
+- 税种设置为 `calculation_type = 'fixed'`
+- `fixed_amount = 0`（表示免税，但需要记录税种）
+
+**场景**:
+1. 在报价单中添加一个固定税（`fixed_amount = 0`）
+2. 报价单条目级税费的 `amount = 0`
+3. 转换为发票时：
+   - **条目级税费**: `if ($tax['amount'])` → `0` 为 false → **被丢弃** ❌
+   - **单据级税费**: 无条件创建 → **被保留** ✅
+
+**后果**:
+- 发票丢失条目级免税记录
+- PDF 预览时条目税费明细不完整
+- 审计时无法追溯免税政策的应用
+
+---
+
+### 9.5 对边界税额场景的影响
+
+**边界场景 1: 极小金额四舍五入为 0**
+```
+条目价格: $0.004
+税率: 10%
+计算税额: $0.0004 → 四舍五入为 $0.00 → amount = 0
+```
+转换时该税费被丢弃。
+
+**边界场景 2: 100% 折扣后税额为 0**
+```
+条目价格: $100
+折扣: 100% → 小计: $0
+税率: 10% → 税额: $0
+```
+转换时该税费被丢弃。
+
+**边界场景 3: 负金额条目**
+如果系统支持负金额条目（如折扣行），税额计算可能为 0 或负数，导致被过滤。
+
+---
+
+### 9.6 修复方案
+
+统一使用 `gettype($tax['amount']) !== 'NULL'` 判断，与常规建单路径保持一致：
+
+```php
+// 条目级税费修复
+foreach ($invoiceItem['taxes'] as $tax) {
+    $tax['company_id'] = $request->header('company');
+    $tax['exchange_rate'] = $exchange_rate;
+    $tax['base_amount'] = $tax['amount'] * $exchange_rate;
+    $tax['currency_id'] = $estimate->currency_id;
+    unset($tax['estimate_item_id']);
+    
+    if (gettype($tax['amount']) !== 'NULL') {  // ✅ 改为仅排除 null
+        $item->taxes()->create($tax);
+    }
+}
+
+// 单据级税费也应保持一致
+if ($estimate->taxes) {
+    foreach ($estimate->taxes->toArray() as $tax) {
+        $tax['company_id'] = $request->header('company');
+        $tax['exchange_rate'] = $exchange_rate;
+        $tax['base_amount'] = $tax['amount'] * $exchange_rate;
+        $tax['currency_id'] = $estimate->currency_id;
+        unset($tax['estimate_id']);
+        
+        if (gettype($tax['amount']) !== 'NULL') {  // ✅ 新增判断
+            $invoice->taxes()->create($tax);
+        }
+    }
+}
+```
+
+**理由**:
+1. 与 `Invoice::createItems()` 和 `Estimate::createItems()` 保持一致
+2. `amount = 0` 可能是合法的业务场景（免税、零税率）
+3. 前端已通过 `amount: null` 区分未设置的税费
+4. 避免数据丢失和不一致
+
+---
+
 ## 10. 三类中途取消路径的实际数据结果
 
 ### 10.1 路径一: 弹窗取消（前端确认阶段）
@@ -651,6 +836,8 @@ public static function deleteInvoices($ids)
 | 位置 | 问题 | 影响 | 严重程度 |
 |------|------|------|---------|
 | ConvertEstimateController:104-112 | 条目级税费未移除 `estimate_item_id` | delete_estimate 配置下触发级联删除，丢失发票条目税费 | 🔴 致命 |
+| ConvertEstimateController:108 | 条目级税费使用 `if ($tax['amount'])` 过滤 | `amount = 0` 的税费（免税、零税率）被丢弃 | 🔴 高 |
+| ConvertEstimateController:115-125 | 单据级税费无条件创建，无任何判断 | 可能创建 `amount = null` 的无效税费记录 | 🔴 高 |
 | ConvertEstimateController:96-100 | 变量名错误 `$estimateItem` 应为 `$invoiceItem` | 发票条目的基准金额字段为空 | 🔴 高 |
 | ConvertEstimateController:104-112 | 条目级税费缺少 `exchange_rate`, `base_amount`, `currency_id` | 多货币报表统计错误 | 🔴 高 |
 | 缺少状态校验 | 任何状态的报价单都可转换 | 业务逻辑不严谨 | 🟡 中 |
@@ -736,6 +923,25 @@ foreach ($invoiceItem['taxes'] as $tax) {
 
 ---
 
+### 12.4 立即修复: 税费金额判断逻辑不一致（高优先级）
+
+**位置**: 
+- 条目级税费: [ConvertEstimateController.php:108](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L108)
+- 单据级税费: [ConvertEstimateController.php:115-125](app/Http/Controllers/V1/Admin/Estimate/ConvertEstimateController.php#L115-L125)
+
+**问题**:
+1. 条目级税费使用 `if ($tax['amount'])` 过滤，导致 `amount = 0` 的合法税费（免税、零税率）被丢弃
+2. 单据级税费无任何判断，无条件创建，可能产生 `amount = null` 的无效记录
+3. 与常规建单路径的 `gettype($tax['amount']) !== 'NULL'` 不一致
+
+**修复后代码**（详见 9.6）:
+- 条目级税费: 改为 `if (gettype($tax['amount']) !== 'NULL')`
+- 单据级税费: 增加相同判断
+
+**影响**: 免税、零税率、极小金额四舍五入为 0 的场景下，税费数据丢失。
+
+---
+
 ## 13. 建议改进
 
 1. **添加状态校验**: 仅允许特定状态（如 SENT、VIEWED、ACCEPTED）的报价单转换
@@ -744,6 +950,7 @@ foreach ($invoiceItem['taxes'] as $tax) {
 4. **修复变量名错误**: 修正第 96-100 行的变量名（见 12.1）
 5. **修复条目级税费外键**: 移除 `estimate_item_id`（见 12.2）
 6. **修复条目级税费字段**: 补齐 `exchange_rate`、`base_amount`、`currency_id`（见 12.3）
-7. **添加重复转换检测**: 已转换的报价单不再显示转换按钮或拒绝转换请求
-8. **添加回滚机制**: 删除转换生成的发票时，根据配置恢复报价单状态
-9. **添加数据完整性校验**: 发票创建完成后验证条目数、税费金额与报价单一致
+7. **统一税费金额判断**: 使用 `gettype($tax['amount']) !== 'NULL'`（见 12.4）
+8. **添加重复转换检测**: 已转换的报价单不再显示转换按钮或拒绝转换请求
+9. **添加回滚机制**: 删除转换生成的发票时，根据配置恢复报价单状态
+10. **添加数据完整性校验**: 发票创建完成后验证条目数、税费金额与报价单一致
