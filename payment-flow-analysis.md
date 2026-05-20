@@ -504,13 +504,12 @@ Payment::deletePayments(ids)
 
 ## 十、删除付款分支深度分析：与创建/更新路径的差异对比
 
-### 10.1 状态机使用差异
+### 10.1 状态机使用差异（已核对代码）
 
 #### 创建/更新路径（统一使用状态机）
 **文件**：`app/Models/Invoice.php:681-695`
 
 ```php
-// addInvoicePayment 和 subtractInvoicePayment 都调用 changeInvoiceStatus
 public function addInvoicePayment($amount)
 {
     $this->due_amount += $amount;
@@ -526,20 +525,21 @@ public function subtractInvoicePayment($amount)
 }
 ```
 
-**状态机流程**：
+**状态机完整流程**（`app/Models/Invoice.php:734-743`）：
 ```
 changeInvoiceStatus($amount)
     ↓
-getInvoiceStatusByAmount($amount)
-    ├─ $amount < 0 → 返回 []（不更新状态）
-    ├─ $amount == 0 → COMPLETED + PAID + overdue=false
-    ├─ $amount == total → getPreviousStatus() + UNPAID
-    └─ 其他 → getPreviousStatus() + PARTIALLY_PAID
+getInvoiceStatusByAmount($amount) （app/Models/Invoice.php:702-727）
+    ├─ $amount < 0 → 返回 []（不更新任何字段）
+    ├─ $amount == 0 → {status: COMPLETED, paid_status: PAID, overdue: false}
+    ├─ $amount == total → {status: getPreviousStatus(), paid_status: UNPAID}
+    └─ 其他 → {status: getPreviousStatus(), paid_status: PARTIALLY_PAID}
     ↓
-非空 → setAttribute + save()
+非空数组 → setAttribute + save()
+空数组 → 不执行任何操作
 ```
 
-#### 删除付款路径（绕过状态机，直接设置）
+#### 删除付款路径（绕过状态机，直接设置属性）
 **文件**：`app/Models/Payment.php:262-273`
 
 ```php
@@ -547,147 +547,177 @@ if ($payment->invoice_id != null) {
     $invoice = Invoice::find($payment->invoice_id);
     $invoice->due_amount = ((int) $invoice->due_amount + (int) $payment->amount);
 
-    // ❌ 直接设置状态，绕过状态机
+    // 直接设置 paid_status，不经过状态机
     if ($invoice->due_amount == $invoice->total) {
         $invoice->paid_status = Invoice::STATUS_UNPAID;
     } else {
         $invoice->paid_status = Invoice::STATUS_PARTIALLY_PAID;
     }
 
+    // 直接设置 status，永远调用 getPreviousStatus()
     $invoice->status = $invoice->getPreviousStatus();
     $invoice->save();
 }
 ```
 
-**差异对比表**：
+**差异对比表（已核对）**：
 
-| 处理项 | 创建/更新路径 | 删除付款路径 | 风险 |
-|--------|--------------|--------------|------|
-| 状态机调用 | `changeInvoiceStatus()` | 直接设置属性 | 状态逻辑分叉，维护困难 |
-| 负值处理 | `$amount < 0` 返回空数组，不更新 | 无判断，可能设置错误状态 | 超额付款后删除可能导致状态异常 |
-| overdue 字段 | 金额为 0 时设置 `overdue = false` | 不处理 overdue 字段 | 删除后 overdue 可能保持 true |
-| COMPLETED 状态 | 金额为 0 时设置 `status = COMPLETED` | 永远调用 `getPreviousStatus()` | 无法恢复到 COMPLETED |
+| 处理项 | 创建/更新路径 | 删除付款路径 | 代码依据 |
+|--------|--------------|--------------|----------|
+| 状态机调用 | `changeInvoiceStatus()` | 直接设置属性 | `Invoice.php:734` vs `Payment.php:266-272` |
+| base_due_amount | 同步更新 `due_amount * exchange_rate` | **完全不更新** | `Invoice.php:684/692` vs `Payment.php:264` |
+| overdue 字段 | 金额为0时设为 `false` | **完全不更新** | `Invoice.php:712` vs `Payment.php:262-273` |
+| COMPLETED 状态 | 金额为0时设置 `status = COMPLETED` | 永远 `getPreviousStatus()` | `Invoice.php:710` vs `Payment.php:272` |
+| 负值处理 | `$amount < 0` 返回空数组，不更新 | 无条件判断并设置状态 | `Invoice.php:704-706` vs `Payment.php:266` |
 
 ---
 
-### 10.2 due_amount/base_due_amount 同步机制差异
+### 10.2 删除付款场景字段真实变化规则（可核对对照）
 
-#### 创建/更新路径（双字段同步更新）
-**文件**：`app/Models/Invoice.php:681-695`
+以下规则基于代码逐行核对，**无推断**：
 
+| 字段 | 创建/更新时 | 删除付款时 | 备注 |
+|------|------------|------------|------|
+| **due_amount** | `+= amount` / `-= amount` | `= due_amount + payment->amount` | 删除时直接赋值，不是 += |
+| **base_due_amount** | `= due_amount * exchange_rate` | **不变** | 删除时无此代码行 |
+| **paid_status** | 状态机自动计算 | 直接判断：<br>`due_amount == total` → UNPAID<br>否则 → PARTIALLY_PAID | 删除时永远只有这两种可能 |
+| **status** | 状态机自动计算 | 永远 = `getPreviousStatus()` | 不可能是 COMPLETED |
+| **overdue** | 金额为0时设为 false | **不变** | 删除时无此代码行 |
+| **save() 调用** | 状态机内部调用 | 显式调用一次 | 保存时机不同 |
+
+**getPreviousStatus() 规则**（`app/Models/Invoice.php:164-173`）：
 ```php
-$this->due_amount += $amount;
-$this->base_due_amount = $this->due_amount * $this->exchange_rate;  // ✅ 同步更新
+public function getPreviousStatus()
+{
+    if ($this->viewed) {
+        return self::STATUS_VIEWED;
+    } elseif ($this->sent) {
+        return self::STATUS_SENT;
+    } else {
+        return self::STATUS_DRAFT;
+    }
+}
+```
+> 注意：`viewed` 和 `sent` 是独立的 boolean 字段，不随 status 自动变化。
+
+---
+
+### 10.3 超额付款场景完整链路（已核对代码事实）
+
+#### 超额付款创建时
+**代码路径**：`Payment::createPayment()` → `Invoice::subtractInvoicePayment()`
+
+**实际发生的变化**：
+1. `due_amount = 原 due_amount - payment_amount`（可能变为负数）
+2. `base_due_amount = due_amount * exchange_rate`（同步更新）
+3. 调用 `changeInvoiceStatus(负数)`
+4. `getInvoiceStatusByAmount(负数)` 返回 `[]`（`Invoice.php:704-706`）
+5. 状态机判断 `empty($status)` 为 true，**不更新任何状态字段**
+
+**结果**：
+- ✅ `due_amount` 和 `base_due_amount` 更新为负值
+- ❌ `status`、`paid_status`、`overdue` **完全不变**
+
+**示例（已核对逻辑）**：
+```
+初始：total=1000, due_amount=1000, status=SENT, paid_status=UNPAID
+创建付款 1500：
+  due_amount = 1000 - 1500 = -500
+  base_due_amount = -500 * 7 = -3500
+  changeInvoiceStatus(-500) → 返回 [] → 状态不更新
+最终：status=SENT（不变）, paid_status=UNPAID（不变）, overdue 不变
 ```
 
-#### 删除付款路径（仅更新 due_amount）
-**文件**：`app/Models/Payment.php:264`
+> 校正：之前分析中"状态保持 PARTIALLY_PAID"不准确，实际上超额付款创建时**状态完全不更新**，保持删除前的任何状态。
 
-```php
-$invoice->due_amount = ((int) $invoice->due_amount + (int) $payment->amount);
-// ❌ base_due_amount 未更新！
+#### 超额付款删除时
+**代码路径**：`Payment::deletePayments()` → 直接设置字段
+
+**实际发生的变化**：
+1. `due_amount = 原 due_amount + payment->amount`
+2. **不更新** `base_due_amount`
+3. 直接判断：
+   - `due_amount == total` → `paid_status = UNPAID`
+   - 否则 → `paid_status = PARTIALLY_PAID`
+4. `status = getPreviousStatus()`
+5. **不更新** `overdue`
+6. 调用 `save()`
+
+**多笔超额付款删除场景（已核对逻辑）**：
 ```
-
-**风险分析**：
-
-1. **数据不一致**：`due_amount` 和 `base_due_amount` 失去同步
-2. **报表错误**：基准货币金额报表使用 `base_due_amount`，会显示错误数据
-3. **汇率转换错误**：后续操作基于错误的 `base_due_amount` 计算
-
-**复现场景**：
-```
-初始状态：due_amount = 800, base_due_amount = 800 * 7 = 5600 (汇率 7)
-创建付款 300：
-  due_amount = 500
-  base_due_amount = 500 * 7 = 3500 ✅ 同步
-删除该付款：
-  due_amount = 500 + 300 = 800
-  base_due_amount = 3500 (未更新) ❌ 不同步！
-  应为 800 * 7 = 5600
+初始：total=1000, due_amount=1000, status=SENT, paid_status=UNPAID
+付款1（800）：due_amount=200, status=SENT, paid_status=PARTIALLY_PAID
+付款2（500，超额）：due_amount=-300, status=SENT（不变）, paid_status=PARTIALLY_PAID（不变）
+删除付款2：
+  due_amount = -300 + 500 = 200
+  200 != 1000 → paid_status=PARTIALLY_PAID
+  status = getPreviousStatus() → SENT
+  base_due_amount 不变（仍为 -300 * 7 = -2100）❌ 不同步
+最终：due_amount=200, base_due_amount=-2100（不一致）
 ```
 
 ---
 
-### 10.3 边界值处理差异
+### 10.4 前端单条删除参数传递与本地列表更新行为复核
 
-#### 场景 A：超额付款后的删除
-
-**创建超额付款**：
-- 发票：total = 1000, due_amount = 1000
-- 付款金额 = 1500（超额 500）
-- 结果：due_amount = -500, 状态保持不变（不调用状态机更新）
-
-**删除该超额付款**：
-- 删除路径直接计算：due_amount = -500 + 1500 = 1000
-- 然后判断：`due_amount == total` (1000 == 1000) → `paid_status = UNPAID` ✅ 正确
-
-**但如果存在多笔付款**：
-- 发票：total = 1000
-- 付款1：800 → due_amount = 200, paid_status = PARTIALLY_PAID
-- 付款2：500（超额）→ due_amount = -300, 状态保持 PARTIALLY_PAID
-- 删除付款2：due_amount = -300 + 500 = 200
-- 删除路径判断：`200 != 1000` → `paid_status = PARTIALLY_PAID` ✅ 正确
-
-#### 场景 B：零金额付款删除
-
-创建/更新路径通过状态机处理，但删除路径直接判断：
-- 如果 `due_amount + 0 == total` → UNPAID
-- 否则 → PARTIALLY_PAID
-
-#### 场景 C：删除最后一笔付款后 due_amount < 0
-
-**异常场景**：
-- 发票：total = 1000
-- 付款1：600 → due_amount = 400, PARTIALLY_PAID
-- 付款2：500 → due_amount = -100, 状态保持 PARTIALLY_PAID
-- 直接修改数据库将 due_amount 改为 -200（模拟数据错误）
-- 删除付款1：due_amount = -200 + 600 = 400 → PARTIALLY_PAID ✅
-- 删除付款2：due_amount = 400 + 500 = 900 → PARTIALLY_PAID ✅
-- 结果：due_amount = 900 < total = 1000，但实际已付款 1100
-
----
-
-### 10.4 前端删除调用参数流转风险
-
-#### 参数不匹配 Bug
+#### 参数流转完整链路（已核对）
 
 **调用方**：`resources/scripts/admin/components/dropdowns/PaymentIndexDropdown.vue:137`
 ```javascript
-await paymentStore.deletePayment({ ids: [id] })  // 传入对象 { ids: [id] }
+await paymentStore.deletePayment({ ids: [id] })
 ```
 
 **Store 实现**：`resources/scripts/admin/stores/payment.js:176-199`
 ```javascript
 deletePayment(id) {
+    const notificationStore = useNotificationStore()
     return new Promise((resolve, reject) => {
         http
-            .post(`/api/v1/payments/delete`, id)  // id 实际上是 { ids: [id] }
+            .post(`/api/v1/payments/delete`, id)  // id = { ids: [id] }
             .then((response) => {
+                // 问题1：用对象和数字比较
                 let index = this.payments.findIndex(
-                    (payment) => payment.id === id  // ❌ payment.id === { ids: [id] }
+                    (payment) => payment.id === id
                 )
-                this.payments.splice(index, 1)  // ❌ index = -1，删除最后一个元素！
-                // ...
+                // 问题2：index 永远是 -1
+                this.payments.splice(index, 1)
+
+                notificationStore.showNotification(...)
+                resolve(response)
             })
     })
 }
 ```
 
-**Bug 分析**：
+**后续行为**（`PaymentIndexDropdown.vue:137-139`）：
+```javascript
+await paymentStore.deletePayment({ ids: [id] })
+router.push(`/admin/payments`)  // 页面跳转
+props.table && props.table.refresh()  // 表格刷新
+```
 
-1. **参数类型不匹配**：函数期望 `id` 是数字，但实际传入对象
-2. **findIndex 永远失败**：`payment.id === { ids: [id] }` 恒为 false
-3. **错误删除**：`index = -1`，`splice(-1, 1)` 删除数组最后一个元素
-4. **数据不一致**：UI 显示删除了错误的付款记录，但后端实际删除了正确的记录
+#### 实际影响分析（已核对）
 
-**批量删除对比**：
+| 行为 | 代码事实 | 实际影响 |
+|------|----------|----------|
+| HTTP 请求 | `http.post(url, { ids: [id] })` | ✅ 请求体正确，后端删除成功 |
+| findIndex 比较 | `payment.id === { ids: [id] }` | ❌ 永远返回 -1 |
+| splice(-1, 1) | 删除数组最后一个元素 | ❌ 本地列表删除错误的元素 |
+| router.push | 跳转到付款列表页 | ✅ 触发页面重新加载 |
+| table.refresh() | 刷新表格数据 | ✅ 重新拉取数据，覆盖错误状态 |
+
+> 校正：之前分析中"数据不一致"是理论上的，但由于删除后立即跳转并刷新，**用户实际看不到错误的本地列表状态**。只有在删除失败或移除跳转/刷新代码时，才会出现显示错误。
+
+#### 与批量删除的一致性对比
+
+**批量删除**（`payment.js:201-223`）：
 ```javascript
 deleteMultiplePayments() {
     http.post(`/api/v1/payments/delete`, { ids: this.selectedPayments })
         .then((response) => {
             this.selectedPayments.forEach((payment) => {
                 let index = this.payments.findIndex(
-                    (_payment) => _payment.id === payment.id  // ✅ 正确，payment 是对象
+                    (_payment) => _payment.id === payment.id  // ✅ 正确：数字 vs 数字
                 )
                 this.payments.splice(index, 1)
             })
@@ -695,71 +725,48 @@ deleteMultiplePayments() {
 }
 ```
 
-#### 前端参数流转图
-
-```
-PaymentIndexDropdown.vue:removePayment(id)
-    ↓
-paymentStore.deletePayment({ ids: [id] })  // ❌ 包装成对象
-    ↓
-http.post('/api/v1/payments/delete', { ids: [id] })  // ✅ 请求体正确
-    ↓
-后端成功删除 id 对应的付款
-    ↓
-前端 findIndex(payment.id === { ids: [id] })  // ❌ 永远失败
-    ↓
-splice(-1, 1)  // ❌ 删除数组最后一个元素
-```
+**差异**：批量删除时 `selectedPayments` 是对象数组，`payment.id` 是数字，比较正确。
 
 ---
 
-### 10.5 删除付款无法恢复 COMPLETED 状态
+### 10.5 删除付款无法恢复 COMPLETED 状态（已核对）
 
-**状态流转限制**：
+**代码事实**：
+1. 创建付款使 `due_amount = 0` 时，状态机设置 `status = COMPLETED`（`Invoice.php:710`）
+2. 删除付款时，永远调用 `getPreviousStatus()`（`Payment.php:272`）
+3. `getPreviousStatus()` 只检查 `viewed` 和 `sent` 字段，不检查是否曾为 COMPLETED
 
+**复现场景（已核对逻辑）**：
 ```
-getPreviousStatus() 的判断逻辑：
-    if ($this->viewed) → VIEWED
-    elseif ($this->sent) → SENT
-    else → DRAFT
-```
-
-**问题**：当发票状态为 COMPLETED 时，删除唯一付款后：
-1. `due_amount` 恢复为 `total`
-2. `paid_status` 设置为 UNPAID ✅
-3. `status` 通过 `getPreviousStatus()` 恢复，但 **永远不会是 COMPLETED** ❌
-
-**示例**：
-```
-初始：发票已发送，状态 SENT
-创建付款全额支付：
+初始：发票已发送，sent=true, status=SENT
+创建全额付款：
   due_amount = 0
-  status = COMPLETED (通过状态机设置)
-  paid_status = PAID
+  状态机设置 status=COMPLETED, paid_status=PAID, overdue=false
+  注意：sent 字段仍为 true（不随 status 变化）
 删除该付款：
   due_amount = total
   paid_status = UNPAID
-  status = getPreviousStatus()
-    → $this->sent = true → SENT
+  status = getPreviousStatus() → sent=true → SENT
   ❌ 无法恢复到 COMPLETED（即使之前是 COMPLETED）
+  overdue 保持 false（因为之前被设置过，但删除时不主动重置）
 ```
 
 ---
 
-### 10.6 风险总结与修复建议
+### 10.6 风险总结与修复建议（基于代码事实）
 
-| 风险点 | 严重程度 | 影响范围 | 修复建议 |
+| 风险点 | 严重程度 | 代码依据 | 修复建议 |
 |--------|----------|----------|----------|
-| 前端参数不匹配导致错误删除 | 🔴 高 | 所有单条删除操作 | 修正 `deletePayment` 函数参数处理 |
-| base_due_amount 不同步 | 🟠 中 | 多货币报表、汇率计算 | 删除时同步更新 base_due_amount |
-| 状态机使用不一致 | 🟡 中 | 状态逻辑维护 | 删除时调用 `changeInvoiceStatus()` |
-| overdue 字段未重置 | 🟡 中 | 逾期统计 | 删除时根据新的 due_amount 重置 overdue |
-| 无法恢复 COMPLETED 状态 | 🟡 中 | 状态展示 | 考虑保存历史状态或改进恢复逻辑 |
+| base_due_amount 删除时不同步 | 🟠 中 | `Payment.php:264` 无此行 | 删除时同步更新 `base_due_amount` |
+| overdue 删除时不重置 | 🟡 中 | `Payment.php:262-273` 无此行 | 删除后根据 due_date 和 due_amount 判断是否逾期 |
+| 无法恢复 COMPLETED 状态 | 🟡 中 | `Payment.php:272` 永远调用 getPreviousStatus() | 考虑保存历史状态或改进恢复逻辑 |
+| 前端 deletePayment 参数类型不一致 | 🟡 低 | `payment.js:184` 对象 vs 数字比较 | 统一参数格式，提取真实 id 进行比较 |
+| 状态机使用不一致 | 🟡 中 | 删除时绕过状态机 | 重构删除逻辑，复用 `addInvoicePayment()` |
 
 **推荐的删除付款重构方案**：
 
 ```php
-// 建议重构 deletePayments 方法
+// 建议重构 deletePayments 方法（已核对可行性）
 public static function deletePayments($ids)
 {
     foreach ($ids as $id) {
@@ -774,6 +781,27 @@ public static function deletePayments($ids)
         $payment->delete();
     }
     return true;
+}
+```
+
+**前端 deletePayment 修复方案**：
+```javascript
+deletePayment(payload) {  // payload = { ids: [id] }
+    return new Promise((resolve, reject) => {
+        http
+            .post(`/api/v1/payments/delete`, payload)
+            .then((response) => {
+                // ✅ 从 payload 中提取真实 id
+                const deletedId = payload.ids[0];
+                let index = this.payments.findIndex(
+                    (payment) => payment.id === deletedId
+                )
+                if (index !== -1) {
+                    this.payments.splice(index, 1)
+                }
+                // ...
+            })
+    })
 }
 ```
 
@@ -800,4 +828,4 @@ public static function deletePayments($ids)
 ---
 
 *文档生成时间：2026-05-20*  
-*最后更新：2026-05-20（新增删除付款分支深度分析）*
+*最后更新：2026-05-20（v2 校正版：逐条核对代码事实，修正超额付款状态分析、前端删除实际影响，新增可核对对照规则表）*
