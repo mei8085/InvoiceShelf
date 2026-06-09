@@ -10,7 +10,7 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 
 ### 1.1 税率类型模型
 
-税率配置的核心模型为 [TaxType.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/TaxType.php)，支持两种计算方式：
+税率配置的核心模型为 `app/Models/TaxType.php`，支持两种计算方式：
 
 | 计算方式 | 字段 | 说明 |
 |---------|------|------|
@@ -21,16 +21,18 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 
 | 属性 | 类型 | 说明 |
 |-----|------|------|
-| `compound_tax` | boolean | **复合税**：在（小计 + 其他简单税）基础上计征 |
+| `compound_tax` | boolean | **复合税**：仅在整体税模式下生效，在（折扣后小计 + 其他简单税）基础上计征 |
 | `collective_tax` | boolean | 集体税标识（预留属性） |
 | `percent` | float | 百分比税率值 |
 | `fixed_amount` | integer | 固定税额（单位：分） |
 
-税率配置的表单验证在 [TaxTypeRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Http/Requests/TaxTypeRequest.php) 中定义。
+> **重要**：`compound_tax` 仅在**整体税模式**（`tax_per_item = 'NO'`）下有意义。行级税模式下，所有税种均为简单税，不存在税上税的叠加。
+
+税率配置的表单验证在 `app/Http/Requests/TaxTypeRequest.php` 中定义。
 
 ### 1.3 税实例模型
 
-具体应用到发票或行项目上的税为 [Tax.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/Tax.php) 模型实例，包含：
+具体应用到发票或行项目上的税为 `app/Models/Tax.php` 模型实例，包含：
 
 - `tax_type_id`：关联的税率类型
 - `amount`：实际计算出的税额（分）
@@ -42,7 +44,7 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 
 ## 二、行级计算层
 
-行级计算由 [CreateItemRow.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue) 组件和 [CreateItemRowTax.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue) 组件共同完成。
+行级计算由 `resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue` 组件和 `resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue` 组件共同完成。
 
 ### 2.1 行金额计算公式
 
@@ -52,7 +54,7 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 行总额(total) = 行小计 - 行折扣值
 ```
 
-核心代码位于 [CreateItemRow.vue L267-L281](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue#L267-L281)：
+核心代码位于 `CreateItemRow.vue`：
 
 ```javascript
 const subtotal = computed(() => Math.round(props.itemData.price * props.itemData.quantity))
@@ -61,15 +63,18 @@ const total = computed(() => subtotal.value - props.itemData.discount_val)
 
 ### 2.2 行级税计算
 
-当 `tax_per_item === 'YES'` 时，每个行项目可独立配置多个税种。行税计算在 [CreateItemRowTax.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue) 中实现。
+当 `tax_per_item === 'YES'` 时，每个行项目可独立配置多个税种。行税计算在 `CreateItemRowTax.vue` 中实现。
+
+> **关键特性**：行级多税**分别基于行折扣后金额独立计算，然后求和**。行级税模式下没有复合税概念，所有税种均以行折扣后金额为基数，不存在税上税叠加。
 
 #### 2.2.1 普通百分比税（税外）
 
 ```
 单税税额 = 行折扣后总额 × 税率%
+行总税 = 税1 + 税2 + ... + 税N  （每个税均以行折扣后总额为基数）
 ```
 
-代码位于 [CreateItemRowTax.vue L175](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue#L175)：
+代码位于 `CreateItemRowTax.vue` 的 `taxAmount` computed 中：
 ```javascript
 return (props.discountedTotal * localTax.percent) / 100
 ```
@@ -83,7 +88,7 @@ return (props.discountedTotal * localTax.percent) / 100
 税额 = 含税总价 - 不含税价格
 ```
 
-代码位于 [CreateItemRowTax.vue L172-L174](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue#L172-L174)：
+代码位于 `CreateItemRowTax.vue`：
 ```javascript
 return Math.round(props.discountedTotal - (props.discountedTotal / (1 + (localTax.percent / 100))))
 ```
@@ -98,7 +103,7 @@ return Math.round(props.discountedTotal - (props.discountedTotal / (1 + (localTa
 行总税 = Σ 该行所有税种的税额
 ```
 
-代码位于 [CreateItemRow.vue L298-L307](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue#L298-L307)：
+代码位于 `CreateItemRow.vue`：
 ```javascript
 const totalSimpleTax = computed(() => {
   return Math.round(
@@ -110,6 +115,8 @@ const totalSimpleTax = computed(() => {
 })
 ```
 
+> **注意**：行级税的变量名为 `totalSimpleTax`，侧面印证了行级税不存在复合税，所有行税都是"简单税"。
+
 ### 2.3 行级折扣与整体折扣的分摊
 
 当 `discount_per_item === 'NO'`（整体折扣）且 `tax_per_item === 'YES'`（行级税）时，计算行税需先按比例分摊整体折扣：
@@ -120,13 +127,26 @@ const totalSimpleTax = computed(() => {
 行折扣后金额 = 行总额 - 行分摊折扣
 ```
 
-代码位于 [CreateItemRowTax.vue L256-L283](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue#L256-L283) 的 `getTaxAmount()` 函数中。
+代码位于 `CreateItemRowTax.vue` 的 `getTaxAmount()` 函数中。
+
+### 2.4 行级税计算分支执行顺序
+
+`CreateItemRowTax.vue` 中 `taxAmount` computed 的判断顺序：
+
+| 优先级 | 条件 | 计算公式 |
+|-------|------|---------|
+| 1 | `calculation_type === 'fixed'` | 直接返回 `fixed_amount` |
+| 2 | `tax_per_item === 'YES'` 且 `discount_per_item === 'NO'` | 调用 `getTaxAmount()`（分摊整体折扣后计算） |
+| 3 | `tax_included === true` | 税内包含公式：反算税额 |
+| 4 | （默认） | 普通百分比税：`discountedTotal × percent / 100` |
+
+> **注意**：行级税计算中**完全没有 `compound_tax` 判断**，复合税属性在行级税模式下不生效。
 
 ---
 
 ## 三、总额结算层
 
-总额计算在 [invoice.js](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js) Store 的 getters 中集中实现，并由 [CreateTotal.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue) 组件展示。
+总额计算在 `resources/scripts/admin/stores/invoice.js` Store 的 getters 中集中实现，并由 `resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue` 组件展示。
 
 ### 3.1 核心 Getter 一览
 
@@ -134,8 +154,8 @@ const totalSimpleTax = computed(() => {
 |------------|------|
 | `getSubTotal` | 所有行项目的 `total` 之和（行折扣后） |
 | `getSubtotalWithDiscount` | 小计 - 整体折扣值 |
-| `getTotalSimpleTax` | 所有简单税（非复合税）之和 |
-| `getTotalCompoundTax` | 所有复合税之和 |
+| `getTotalSimpleTax` | 所有简单税（非复合税）之和（仅整体税模式） |
+| `getTotalCompoundTax` | 所有复合税之和（仅整体税模式） |
 | `getTotalTax` | 总税额 = 简单税 + 复合税（整体税模式）或 行税之和（行级税模式） |
 | `getTotal` | 最终发票总额 |
 | `getNetTotal` | 净总额 = 折扣后小计 - 总税（税内包含模式下展示） |
@@ -146,7 +166,7 @@ const totalSimpleTax = computed(() => {
 小计(sub_total) = Σ 每个行项目的 total（行折扣后金额）
 ```
 
-代码：[invoice.js L47-L51](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js#L47-L51)
+代码：`invoice.js` 的 `getSubTotal` getter
 
 ### 3.3 整体折扣计算
 
@@ -155,11 +175,11 @@ const totalSimpleTax = computed(() => {
 - **百分比折扣**：`discount_val = sub_total × discount%`
 - **固定金额折扣**：`discount_val = discount × 100`（输入为元，转为分）
 
-代码位于 [CreateTotal.vue L323-L334](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue#L323-L334) 的 `setDiscount()` 函数中。
+代码位于 `CreateTotal.vue` 的 `setDiscount()` 函数中。
 
 ### 3.4 整体税计算（tax_per_item = 'NO'）
 
-当 `tax_per_item === 'NO'` 时，税种应用于整单。
+当 `tax_per_item === 'NO'` 时，税种应用于整单，支持简单税和复合税两种类型。
 
 #### 3.4.1 简单税（Simple Tax）
 
@@ -168,7 +188,17 @@ const totalSimpleTax = computed(() => {
 总简单税 = Σ 所有非复合税的税额
 ```
 
-代码：[invoice.js L57-L64](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js#L57-L64)
+代码：`invoice.js` 的 `getTotalSimpleTax` getter：
+```javascript
+getTotalSimpleTax() {
+  return _.sumBy(this.newInvoice.taxes, function (tax) {
+    if (!tax.compound_tax) {
+      return tax.amount
+    }
+    return 0
+  })
+}
+```
 
 #### 3.4.2 复合税（Compound Tax）
 
@@ -179,7 +209,7 @@ const totalSimpleTax = computed(() => {
 总复合税 = Σ 所有复合税的税额
 ```
 
-代码位于 [CreateTotalTaxes.vue L64-L70](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotalTaxes.vue#L64-L70)：
+代码位于 `resources/scripts/admin/components/estimate-invoice-common/CreateTotalTaxes.vue`：
 ```javascript
 if (props.tax.compound_tax && props.store.getSubtotalWithDiscount) {
   return Math.round(
@@ -189,6 +219,11 @@ if (props.tax.compound_tax && props.store.getSubtotalWithDiscount) {
 }
 ```
 
+> **关键点**：
+> - 复合税的基数 = 折扣后小计 + **简单税总和**
+> - 复合税的基数**不包括其他复合税**
+> - 复合税仅在整体税模式下生效
+
 #### 3.4.3 税内包含模式下的整体税
 
 ```
@@ -196,9 +231,26 @@ if (props.tax.compound_tax && props.store.getSubtotalWithDiscount) {
 税额 = 折扣后小计 - 不含税小计
 ```
 
-代码位于 [CreateTotalTaxes.vue L71-L77](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotalTaxes.vue#L71-L77)。
+代码位于 `CreateTotalTaxes.vue`。
 
-### 3.5 行级税汇总（tax_per_item = 'YES'）
+### 3.5 整体税计算分支执行顺序
+
+`CreateTotalTaxes.vue` 中 `taxAmount` computed 的判断顺序：
+
+| 优先级 | 条件 | 计算公式 |
+|-------|------|---------|
+| 1 | `calculation_type === 'fixed'` | 直接返回 `fixed_amount` |
+| 2 | `compound_tax === true` 且有折扣后小计 | 复合税公式：`(折扣后小计 + 总简单税) × 税率%` |
+| 3 | `tax_included === true` 且有税率 | 税内包含公式：反算税额 |
+| 4 | （默认）有税率 | 普通百分比税：`折扣后小计 × 税率%` |
+| 5 | （无基数） | 返回 0 |
+
+> **重要结论**：
+> 1. **复合税优先于税内包含**：当一个税被标记为复合税时，即使 `tax_included = true`，也会按复合税公式计算，不会使用税内包含公式。
+> 2. **简单税受 tax_included 影响**：非复合的简单税，在 `tax_included = true` 时使用反算公式。
+> 3. **固定金额税优先级最高**：直接取固定值，不受其他任何开关影响。
+
+### 3.6 行级税汇总（tax_per_item = 'YES'）
 
 当 `tax_per_item === 'YES'` 时，总税为所有行项目的税之和：
 
@@ -206,9 +258,22 @@ if (props.tax.compound_tax && props.store.getSubtotalWithDiscount) {
 总税 = Σ 每个行项目的 tax（行税合计）
 ```
 
-代码：[invoice.js L75-L85](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js#L75-L85)
+代码：`invoice.js` 的 `getTotalTax` getter：
+```javascript
+getTotalTax() {
+  if (
+    this.newInvoice.tax_per_item === 'NO' ||
+    this.newInvoice.tax_per_item === null
+  ) {
+    return this.getTotalSimpleTax + this.getTotalCompoundTax
+  }
+  return _.sumBy(this.newInvoice.items, function (tax) {
+    return tax.tax
+  })
+}
+```
 
-同时在 [CreateTotal.vue L289-L313](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue#L289-L313) 中按税种聚合展示：
+同时在 `CreateTotal.vue` 中按税种聚合展示：
 
 ```javascript
 const itemWiseTaxes = computed(() => {
@@ -229,14 +294,14 @@ const itemWiseTaxes = computed(() => {
 })
 ```
 
-### 3.6 最终总额
+### 3.7 最终总额
 
 根据 `tax_included` 开关有两种计算方式：
 
 | 模式 | 公式 | 代码位置 |
 |-----|------|---------|
-| 税外（默认） | `total = 折扣后小计 + 总税` | [invoice.js L95](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js#L95) |
-| 税内包含 | `total = 折扣后小计`（税已包含在内） | [invoice.js L92-L94](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js#L92-L94) |
+| 税外（默认） | `total = 折扣后小计 + 总税` | `invoice.js` 的 `getTotal` |
+| 税内包含 | `total = 折扣后小计`（税已包含在内） | `invoice.js` 的 `getTotal` |
 
 税内包含模式下，还会展示**净总额**（不含税金额）：
 
@@ -244,7 +309,7 @@ const itemWiseTaxes = computed(() => {
 净总额(net_total) = 折扣后小计 - 总税
 ```
 
-代码：[invoice.js L53-L55](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js#L53-L55)
+代码：`invoice.js` 的 `getNetTotal` getter
 
 ---
 
@@ -262,6 +327,7 @@ const itemWiseTaxes = computed(() => {
                      ┌────────────────────┴────────────────────┐
                      ↓                                         ↓
               简单税：折扣后小计 × 税率%                复合税：(折扣后小计 + Σ简单税) × 税率%
+              （tax_included 时反算）                       （不受 tax_included 影响）
                      ↓                                         ↓
                      └────────────────────┬────────────────────┘
                                           ↓
@@ -279,10 +345,12 @@ const itemWiseTaxes = computed(() => {
 ┌───────────────── 行1 ─────────────────┐
 │  行小计 - 行折扣 = 行折扣后总额         │
 │                          ↓             │
-│                  行税1: 行折扣后总额 × 税1% │
-│                  行税2: 行折扣后总额 × 税2% │
+│                  税1: 行折扣后总额 × 税1%  │
+│                  税2: 行折扣后总额 × 税2%  │
+│                  税3: 行折扣后总额 × 税3%  │
 │                          ↓             │
-│                  行税合计 = 行税1 + 行税2  │
+│                  行税合计 = 税1 + 税2 + 税3  │
+│          （所有税均独立计算，无叠加）      │
 └───────────────────────────────────────┘
               ↓
 ┌───────────────── 行2 ─────────────────┐
@@ -292,8 +360,12 @@ const itemWiseTaxes = computed(() => {
          Σ 所有行的行折扣后总额  →  小计(sub_total)
          Σ 所有行的行税合计     →  总税(getTotalTax)
               ↓
-         最终总额计算（同整体税模式）
+         最终总额计算（同整体税模式的最终步骤）
 ```
+
+> **关键对比**：
+> - 整体税模式：存在复合税，简单税计入复合税基数
+> - 行级税模式：无复合税概念，每行的所有税均独立基于行折扣后金额计算
 
 ---
 
@@ -301,11 +373,11 @@ const itemWiseTaxes = computed(() => {
 
 | 配置项 | 位置 | 说明 |
 |-------|------|------|
-| `tax_per_item` | CompanySetting | `YES`=行级税，`NO`=整体税 |
+| `tax_per_item` | CompanySetting | `YES`=行级税，`NO`=整体税（决定是否启用复合税） |
 | `discount_per_item` | CompanySetting | `YES`=行级折扣，`NO`=整体折扣 |
-| `tax_included` | 发票级 | `true`=税内包含，`false`=税外 |
+| `tax_included` | 发票级 | `true`=税内包含，`false`=税外（复合税不受此开关影响） |
 | `tax_included_by_default` | CompanySetting | 默认是否启用税内包含 |
-| `compound_tax` | TaxType | 是否为复合税 |
+| `compound_tax` | TaxType | 是否为复合税（仅整体税模式下生效） |
 | `calculation_type` | TaxType | `percentage`=百分比，`fixed`=固定金额 |
 
 ---
@@ -314,7 +386,7 @@ const itemWiseTaxes = computed(() => {
 
 ### 6.1 后端接收
 
-前端计算完成后，通过 [InvoicesRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Http/Requests/InvoicesRequest.php) 提交以下关键字段：
+前端计算完成后，通过 `app/Http/Requests/InvoicesRequest.php` 提交以下关键字段：
 
 - `sub_total`：小计
 - `discount_val`：折扣值
@@ -327,14 +399,14 @@ const itemWiseTaxes = computed(() => {
 
 ### 6.2 后端存储
 
-后端在 [Invoice.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/Invoice.php) 的 `createInvoice()` 和 `createItems()` 方法中存储：
+后端在 `app/Models/Invoice.php` 的 `createInvoice()` 和 `createItems()` 方法中存储：
 
 - 基础金额字段直接存储
 - 同时存储 `base_*` 字段（按汇率换算为公司本位币）
 - 行级税存储在 `taxes` 表，关联 `invoice_item_id`
 - 整体税存储在 `taxes` 表，关联 `invoice_id`
 
-关键代码：[Invoice.php L500-L560](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/Invoice.php#L500-L560)
+关键代码：`Invoice.php` 的 `createItems()` 和 `createTaxes()` 方法
 
 ### 6.3 金额单位约定
 
@@ -344,28 +416,59 @@ const itemWiseTaxes = computed(() => {
 
 ---
 
-## 七、代码文件索引
+## 七、复合税与税内包含的交互说明
+
+### 7.1 整体税模式下的分支优先级
+
+在 `CreateTotalTaxes.vue` 中，单个税种的税额计算遵循以下优先级：
+
+```
+固定金额税 → 复合税 → 税内包含简单税 → 普通简单税
+```
+
+这意味着：
+
+| 场景 | 行为 |
+|-----|------|
+| 固定金额税 | 直接取固定值，忽略所有其他设置 |
+| 复合税 + tax_included | 按复合税公式计算（tax_included 对复合税无效） |
+| 简单税 + tax_included | 按税内包含公式反算税额 |
+| 简单税（无 tax_included） | 按普通百分比公式计算 |
+
+### 7.2 行级税模式下的分支优先级
+
+在 `CreateItemRowTax.vue` 中，单个税种的税额计算遵循以下优先级：
+
+```
+固定金额税 → （整体折扣分摊） → 税内包含 → 普通百分比税
+```
+
+> 注意：行级税完全没有复合税分支，`compound_tax` 属性在行级税模式下被忽略。
+
+---
+
+## 八、代码文件索引
 
 ### 模型层
-- [TaxType.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/TaxType.php) - 税率类型模型
-- [Tax.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/Tax.php) - 税实例模型
-- [InvoiceItem.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/InvoiceItem.php) - 发票行项目模型
-- [Invoice.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Models/Invoice.php) - 发票主模型
+- `app/Models/TaxType.php` - 税率类型模型
+- `app/Models/Tax.php` - 税实例模型
+- `app/Models/InvoiceItem.php` - 发票行项目模型
+- `app/Models/Invoice.php` - 发票主模型
 
 ### 请求验证层
-- [TaxTypeRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Http/Requests/TaxTypeRequest.php) - 税率类型请求验证
-- [InvoicesRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/app/Http/Requests/InvoicesRequest.php) - 发票请求验证
+- `app/Http/Requests/TaxTypeRequest.php` - 税率类型请求验证
+- `app/Http/Requests/InvoicesRequest.php` - 发票请求验证
 
 ### 前端计算层
-- [invoice.js](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/stores/invoice.js) - 发票状态管理（核心计算 getters）
-- [CreateItemRow.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue) - 行项目组件
-- [CreateItemRowTax.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue) - 行税计算组件
-- [CreateTotal.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue) - 总额展示组件
-- [CreateTotalTaxes.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateTotalTaxes.vue) - 整体税计算组件
-- [NetTotal.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/NetTotal.vue) - 净总额展示组件
+- `resources/scripts/admin/stores/invoice.js` - 发票状态管理（核心计算 getters）
+- `resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue` - 行项目组件
+- `resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue` - 行税计算组件
+- `resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue` - 总额展示组件
+- `resources/scripts/admin/components/estimate-invoice-common/CreateTotalTaxes.vue` - 整体税计算组件
+- `resources/scripts/admin/components/estimate-invoice-common/NetTotal.vue` - 净总额展示组件
 
 ### 测试文件
-- [InvoiceTest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/tests/Unit/InvoiceTest.php) - 发票模型测试
-- [InvoiceItemTest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/tests/Unit/InvoiceItemTest.php) - 发票行项目测试
-- [TaxTest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/tests/Unit/TaxTest.php) - 税测试
-- [TaxTypeTest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/123-InvoiceShelf/tests/Unit/TaxTypeTest.php) - 税率类型测试
+- `tests/Unit/InvoiceTest.php` - 发票模型测试
+- `tests/Unit/InvoiceItemTest.php` - 发票行项目测试
+- `tests/Unit/TaxTest.php` - 税测试
+- `tests/Unit/TaxTypeTest.php` - 税率类型测试
