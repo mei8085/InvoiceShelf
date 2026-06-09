@@ -88,19 +88,209 @@ public function __invoke(Request $request)
 
 ## 三、规则校验机制
 
-### 3.1 校验层级与实际情况
+### 3.1 校验层级总览
 
-| 层级 | 校验内容 | 实际存在性 | 位置 |
-|------|---------|-----------|------|
-| 权限层 | 用户是否有备份管理权限 | ✅ 是 | 控制器方法开头 `authorize()` |
-| 输入层 | 请求参数格式校验 | ⚠️ 部分有 | 仅 `destroy` 和 `download` 校验 path |
-| 业务层 | 业务逻辑校验 | ✅ 是 | 队列执行时由 `BackupConfigurationFactory` 校验 |
+备份服务的校验分布在四个层级，各层的校验强度差异很大：
 
-### 3.2 已定义但**未被调用**的规则类
+| 层级 | 校验内容 | 校验强度 | 位置 |
+|------|---------|---------|------|
+| 前端层 | option 必填、磁盘必填、下拉选值 | 🔒 严格 | BackupModal.vue（vuelidate + 下拉） |
+| 权限层 | 用户是否有备份管理权限 | 🔒 严格 | 控制器 `authorize('manage backups')` |
+| HTTP 输入层 | 请求参数格式校验 | ⚠️ 极弱 | 仅 destroy/download 校验 path，store 完全没有 |
+| 业务层 | company、file_disk_id 非空 | ⚠️ 不完整 | 队列执行时 BackupConfigurationFactory |
 
-项目自定义了三个备份验证规则类，但**只有一个被实际使用**：
+**最大的特点**：前端做了完整的表单校验，后端 `store` 接口完全没有参数校验，直接入队。真正的业务校验延迟到队列任务执行时才做，而且校验本身也有漏洞。
 
-#### （1）PathToZip - 路径必须指向 ZIP 文件
+---
+
+### 3.2 前端校验链路（完整且严格）
+
+前端 [BackupModal.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/components/modal-components/BackupModal.vue) 共有五层防护，确保正常使用时发出的数据一定合法。
+
+#### 第一层：数据初始化有默认值
+
+[backup.js:11-17](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/stores/backup.js#L11-L17)
+
+```js
+state: () => ({
+  currentBackupData: {
+    option: 'full',     // option 默认就是 'full'，不会为空
+    selected_disk: null, // 磁盘默认 null，需要用户选择
+  },
+})
+```
+
+打开弹窗时还会默认选第一个磁盘：
+```js
+// BackupModal.vue:167-170
+async function loadData() {
+  let res = await diskStore.fetchDisks({ limit: 'all' })
+  backupStore.currentBackupData.selected_disk = res.data.data[0]
+}
+```
+
+#### 第二层：UI 组件约束
+
+- `BaseMultiselect` 组件设置了 `:can-deselect="false"` 和 `:allow-empty="false"`，用户无法取消选择
+- 下拉选择框限制了 `option` 只能是 `['full', 'only-db', 'only-files']` 三个值
+- 磁盘选择也是下拉，只能从已有的磁盘列表中选
+
+#### 第三层：vuelidate 校验规则
+
+[BackupModal.vue:125-136](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/components/modal-components/BackupModal.vue#L125-L136)
+
+```js
+const rules = computed(() => {
+  return {
+    currentBackupData: {
+      option: {
+        required: helpers.withMessage(t('validation.required'), required),
+      },
+      selected_disk: {
+        required: helpers.withMessage(t('validation.required'), required),
+      },
+    },
+  }
+})
+```
+
+两个字段都是必填的。
+
+#### 第四层：提交前拦截
+
+[BackupModal.vue:143-147](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/components/modal-components/BackupModal.vue#L143-L147)
+
+```js
+async function createNewBackup() {
+  v$.value.currentBackupData.$touch()       // 触发所有校验
+  if (v$.value.currentBackupData.$invalid) { // 校验不通过就 return
+    return true
+  }
+  // 只有校验通过才会往下执行...
+}
+```
+
+#### 第五层：组装数据并调用 API
+
+[BackupModal.vue:149-155](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/components/modal-components/BackupModal.vue#L149-L155)
+
+```js
+let data = {
+  option: backupStore.currentBackupData.option,
+  file_disk_id: backupStore.currentBackupData.selected_disk.id,
+  // selected_disk 是对象，取 .id 作为 file_disk_id
+}
+let res = await backupStore.createBackup(data)
+```
+
+最终通过 [backup.js:35-39](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/stores/backup.js#L35-L39) 发送 POST 请求：
+
+```js
+createBackup(data) {
+  return http.post(`/api/v1/backups`, data)
+}
+```
+
+> **前端小结**：从数据初始化 → 组件约束 → 校验规则 → 提交拦截 → API 调用，一共五层防护。正常使用前端界面的情况下，发到后端的数据一定是合法的。
+
+---
+
+### 3.3 后端 HTTP 层校验（store 接口完全没有）
+
+对比前端的层层防护，后端 [BackupsController@store](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L75-L85) 的处理极其简单：
+
+```php
+public function store(Request $request)
+{
+    $this->authorize('manage backups');  // ← 唯一的校验：权限
+
+    $data = $request->all();             // ← 直接拿所有参数，不验证
+    $data['company'] = $request->header('company');
+
+    dispatch(new CreateBackupJob($data)) // ← 直接入队
+        ->onQueue(config('backup.queue.name'));
+
+    return $this->respondSuccess();      // ← 立即返回成功
+}
+```
+
+**store 接口没有的校验：**
+- ❌ 没有 `$request->validate()`
+- ❌ 没有 Form Request 类
+- ❌ 没有 `option` 的白名单校验（in:full,only-db,only-files）
+- ❌ 没有 `file_disk_id` 的整数类型校验
+- ❌ 没有 `file_disk_id` 的存在性校验（exists:file_disks,id）
+- ❌ 没有任何异常捕获
+
+**其他接口有部分校验：**
+- `destroy` 方法：校验 `path` 必须是 ZIP 路径（用 PathToZip 规则）
+- `DownloadBackupController`：同样校验 `path` 必须是 ZIP 路径
+
+> **设计意图推测**：开发者可能认为「有前端校验就够了」，或者是为了代码简洁。但对于 API 来说，后端不做校验是有风险的。
+
+---
+
+### 3.4 业务层校验：BackupConfigurationFactory（不完整，有漏洞）
+
+参数的真正校验发生在队列任务执行时，由 [BackupConfigurationFactory::make()](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Space/BackupConfigurationFactory.php) 进行。但这里的校验**不完整**，存在明显漏洞。
+
+#### 逐行分析执行路径
+
+```php
+// 第 12 行：入口方法
+public static function make($data = []): Config
+{
+    // 第 14-16 行：校验 company 不为空
+    if (blank($data['company'] ?? null)) {
+        throw new Exception('The Company ID is missig');
+    }
+    // ✅ 这行是对的：company 为空就抛异常
+
+    // 第 18-20 行：校验 file_disk_id 不为空
+    if (blank($data['file_disk_id'] ?? null)) {
+        throw new Exception('No file disk selected');
+    }
+    // ✅ 这行也是对的：file_disk_id 为空就抛异常
+
+    // 第 22 行：查询 FileDisk 记录
+    $fileDisk = FileDisk::find($data['file_disk_id']);
+    // ⚠️ 问题在这里！find() 找不到记录会返回 null，但代码没检查
+
+    // 第 24 行：直接调用 setConfig()
+    $fileDisk->setConfig();
+    // 💥 如果 $fileDisk 是 null，这里会报 Fatal Error！
+    // 错误信息："Call to a member function setConfig() on null"
+
+    // 第 26-28 行：设置备份目标磁盘
+    $prefix = env('DYNAMIC_DISK_PREFIX', 'temp_');
+    config(['backup.backup.destination.disks' => [$prefix.$fileDisk->driver]]);
+    // 💥 如果 $fileDisk 是 null，这里也会报错
+    // 错误信息："Attempt to read property 'driver' on null"
+
+    // ... 后续代码
+}
+```
+
+#### 校验漏洞总结表
+
+| 校验项 | 是否有校验 | 失败时的结果 | 错误级别 |
+|-------|-----------|-------------|---------|
+| `company` 为空 | ✅ 有 | 抛出 `Exception`，队列任务失败 | 普通异常 |
+| `file_disk_id` 为空 | ✅ 有 | 抛出 `Exception`，队列任务失败 | 普通异常 |
+| `file_disk_id` 无效（找不到记录） | ❌ **没有** | 调用 `null->setConfig()`，Fatal Error | **致命错误** |
+
+> **关键事实**：传一个不存在的 `file_disk_id`（比如 `9999`），比传空值的后果更严重。空值至少是个正常的 Exception，无效 ID 是 PHP Fatal Error，可能影响队列 Worker 的稳定性。
+
+> **其他小问题**：第 15 行有拼写错误 `'The Company ID is missig'` → 应为 `missing`。
+
+---
+
+### 3.5 已定义但未被调用的规则类（死代码）
+
+项目自定义了三个备份验证规则类，但**只有一个被实际使用**，另外两个是「死代码」。
+
+#### （1）PathToZip - 路径必须指向 ZIP 文件 ✅ 实际使用
+
 [app/Rules/Backup/PathToZip.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Rules/Backup/PathToZip.php)
 
 ```php
@@ -113,10 +303,11 @@ public function validate(string $attribute, mixed $value, Closure $fail): void
 ```
 
 **实际调用位置**：
-- [BackupsController@destroy](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L96-L98) - 删除备份时校验
-- [DownloadBackupController](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/DownloadBackupController.php#L20-L22) - 下载备份时校验
+- [BackupsController@destroy](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L96-L98) - 删除备份时校验 path
+- [DownloadBackupController](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/DownloadBackupController.php#L20-L22) - 下载备份时校验 path
 
-#### （2）BackupDisk - 磁盘必须是已配置的备份磁盘
+#### （2）BackupDisk - 磁盘必须是已配置的备份磁盘 ❌ 未使用
+
 [app/Rules/Backup/BackupDisk.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Rules/Backup/BackupDisk.php)
 
 ```php
@@ -129,9 +320,10 @@ public function validate(string $attribute, mixed $value, Closure $fail): void
 }
 ```
 
-> **重要事实**：此规则类**从未在代码中被调用**，属于"死代码"。
+> **事实**：此规则类在整个代码库中**从未被调用**，属于死代码。
 
-#### （3）FilesystemDisks - 磁盘必须是已配置的文件系统磁盘
+#### （3）FilesystemDisks - 磁盘必须是已配置的文件系统磁盘 ❌ 未使用
+
 [app/Rules/Backup/FilesystemDisks.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Rules/Backup/FilesystemDisks.php)
 
 ```php
@@ -144,35 +336,9 @@ public function validate(string $attribute, mixed $value, Closure $fail): void
 }
 ```
 
-> **重要事实**：此规则类也**从未在代码中被调用**，属于"死代码"。
+> **事实**：此规则类也**从未被调用**，同样是死代码。
 
-### 3.3 真正的业务校验：BackupConfigurationFactory
-
-备份参数的实际校验发生在队列执行阶段，由 [BackupConfigurationFactory::make()](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Space/BackupConfigurationFactory.php) 进行：
-
-```php
-public static function make($data = []): Config
-{
-    if (blank($data['company'] ?? null)) {
-        throw new Exception('The Company ID is missig');
-    }
-
-    if (blank($data['file_disk_id'] ?? null)) {
-        throw new Exception('No file disk selected');
-    }
-
-    $fileDisk = FileDisk::find($data['file_disk_id']);
-    // ... 后续配置组装
-}
-```
-
-**校验内容**：
-1. `company` 参数不能为空
-2. `file_disk_id` 参数不能为空
-3. 通过 `file_disk_id` 能找到有效的 `FileDisk` 记录
-
-> **注意**：此处有拼写错误 `missig` → 应为 `missing`。
-> **设计特点**：校验不是在 HTTP 请求阶段进行，而是延迟到队列任务执行时。如果参数错误，队列任务会失败，用户无法从 HTTP 响应中得知。
+> **推测**：这两个规则类可能是早期版本留下来的，或者计划要用但还没接入。
 
 ---
 
@@ -546,6 +712,8 @@ if ($companyNotificationEmail) {
 | [app/Rules/Backup/BackupDisk.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Rules/Backup/BackupDisk.php) | 备份磁盘校验（**未使用**） | 全文 |
 | [app/Rules/Backup/FilesystemDisks.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Rules/Backup/FilesystemDisks.php) | 文件系统磁盘校验（**未使用**） | 全文 |
 | [app/Models/FileDisk.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Models/FileDisk.php) | 文件磁盘模型（动态配置） | 83-112 |
+| [resources/scripts/admin/components/modal-components/BackupModal.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/components/modal-components/BackupModal.vue) | 前端备份弹窗（有校验） | 全文 |
+| [resources/scripts/admin/stores/backup.js](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/stores/backup.js) | 前端状态管理 | 全文 |
 | [app/Http/Controllers/V1/Webhook/CronJobController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Webhook/CronJobController.php) | Cron Webhook 入口 | 全文 |
 | [routes/console.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/routes/console.php) | 调度任务定义（无备份任务） | 全文 |
 | [tests/Feature/Admin/BackupTest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/tests/Feature/Admin/BackupTest.php) | 备份功能测试 | 全文 |
