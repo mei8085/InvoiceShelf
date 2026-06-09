@@ -234,7 +234,171 @@ const totalSimpleTax = computed(() => {
 
 代码位于 `CreateItemRowTax.vue` 的 `getTaxAmount()` 函数中。
 
-### 2.4 行级税计算分支执行顺序
+### 2.4 行级整体折扣分摊的 toFixed 舍入影响
+
+> **适用场景**：仅当 `tax_per_item === 'YES'`（行级税）且 `discount_per_item === 'NO'`（整体折扣）时，行税计算才需要分摊整体折扣，才会触发 `toFixed` 舍入。
+
+#### 2.4.1 四种配置组合的行为对比
+
+| tax_per_item | discount_per_item | 是否走 getTaxAmount() | 是否触发 toFixed 舍入 | 说明 |
+|-------------|-------------------|----------------------|---------------------|------|
+| YES | NO | ✅ 是 | ✅ 是 | **有舍入问题**：行税需分摊整体折扣 |
+| YES | YES | ❌ 否 | ❌ 否 | 行级折扣，直接用行折扣后金额计税 |
+| NO | NO | ❌ 否 | ❌ 否 | 整体税，直接用整单折扣后小计计税 |
+| NO | YES | ❌ 否 | ❌ 否 | 整体税 + 行级折扣（少见组合） |
+
+#### 2.4.2 调用链与数据流
+
+`CreateItemRow.vue` 向 `CreateItemRowTax.vue` 传入：
+- `discounted-total` = 行项目的 `total`（行小计 - 行折扣值）
+
+`taxAmount` computed 中的判断顺序：
+```javascript
+if (taxPerItemEnabled && !discountPerItemEnabled) {
+  return getTaxAmount()  // 分摊整体折扣后计税
+}
+```
+
+#### 2.4.3 getTaxAmount() 完整计算流程
+
+`resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue` 的 `getTaxAmount()` 函数：
+
+```javascript
+function getTaxAmount() {
+  if (localTax.calculation_type === 'fixed') {
+    return localTax.fixed_amount
+  }
+
+  let total = 0
+  let discount = 0
+  const itemTotal = props.discountedTotal           // 当前行的总额（行折扣后）
+  const modelDiscount = props.store[props.storeProp].discount  // 整体折扣值
+  const type = props.store[props.storeProp].discount_type      // 折扣类型
+  let discountedTotal = props.discountedTotal
+
+  if (modelDiscount > 0) {
+    // 步骤1：计算所有行的总额之和
+    props.store[props.storeProp].items.forEach((_i) => {
+      total += _i.total
+    })
+    // 步骤2：计算当前行的占比（保留两位小数 ⚠️）
+    const proportion = (itemTotal / total).toFixed(2)
+    // 步骤3：计算总折扣金额（分）
+    discount = type === 'fixed' 
+      ? modelDiscount * 100           // 固定金额：元转分
+      : (total * modelDiscount) / 100  // 百分比：总额 × 折扣率
+    // 步骤4：计算当前行应分摊的折扣
+    const itemDiscount = Math.round(discount * proportion)
+    // 步骤5：分摊折扣后的行金额（作为税基）
+    discountedTotal = itemTotal - itemDiscount
+  }
+
+  // 步骤6：基于分摊折扣后的金额计算税
+  if (props.store[props.storeProp].tax_included) {
+    return Math.round(discountedTotal - (discountedTotal / (1 + (localTax.percent / 100))))
+  }
+  return Math.round((discountedTotal * localTax.percent) / 100)
+}
+```
+
+#### 2.4.4 toFixed(2) 的舍入原理
+
+`toFixed(2)` 将比例值四舍五入到小数点后两位（即精确到 **1%** 的精度）：
+
+| 实际比例 | toFixed(2) 后 | 方向 | 误差 |
+|---------|--------------|------|------|
+| 0.3333 | "0.33" | 舍去 | -0.0033 |
+| 0.3350 | "0.34" | 进位 | +0.0050 |
+| 0.0049 | "0.00" | 舍去 | -0.0049 |
+| 0.9950 | "1.00" | 进位 | +0.0050 |
+
+> **注意**：`toFixed()` 返回的是字符串，但参与乘法运算时会自动转换为数字。
+
+#### 2.4.5 尾差累积案例
+
+**案例1：三行平分折扣——尾差低估**
+
+假设：3 行项目，行金额分别为 333/333/334，总计 1000 分，整体折扣 10%（100 分）
+
+| 行号 | 行金额 | 实际占比 | toFixed(2) 后 | 分摊折扣（100分） | 实际应分摊 | 偏差 |
+|-----|--------|---------|--------------|-----------------|------------|------|
+| 行1 | 333 | 33.30% | 0.33 | 33 | 33.3 | -0.3 |
+| 行2 | 333 | 33.30% | 0.33 | 33 | 33.3 | -0.3 |
+| 行3 | 334 | 33.40% | 0.33 | 33 | 33.4 | -0.4 |
+| **合计** | **1000** | **100%** | **0.99** | **99** | **100** | **-1** |
+
+> 总折扣分摊了 99 分，少了 1 分。这 1 分的尾差导致税基合计比实际多 1 分，税合计也相应偏高。
+
+**案例2：多行小额折扣——尾差高估**
+
+假设：3 行项目，行金额分别为 1/1/1998，总计 2000 分，整体折扣 10%（200 分）
+
+| 行号 | 行金额 | 实际占比 | toFixed(2) 后 | 分摊折扣（200分） | 实际应分摊 | 偏差 |
+|-----|--------|---------|--------------|-----------------|------------|------|
+| 行1 | 1 | 0.05% | 0.01 | 2 | 0.1 | +1.9 |
+| 行2 | 1 | 0.05% | 0.01 | 2 | 0.1 | +1.9 |
+| 行3 | 1998 | 99.90% | 1.00 | 200 | 199.8 | +0.2 |
+| **合计** | **2000** | **100%** | **1.02** | **204** | **200** | **+4** |
+
+> 总折扣分摊了 204 分，多了 4 分。比例合计 1.02 > 1，导致超额分摊。
+
+#### 2.4.6 小额行归零案例
+
+**案例3：极低占比行——完全不分摊折扣**
+
+当行金额占比 < 0.5% 时，`toFixed(2)` 会归为 0.00，导致该行不分摊任何折扣。
+
+| 行号 | 行金额 | 总金额 | 实际占比 | toFixed(2) 后 | 分摊折扣（1000分） |
+|-----|--------|-------|---------|--------------|------------------|
+| 行1 | 49 | 10000 | 0.49% | 0.00 | 0 |
+| 行2 | 9951 | 10000 | 99.51% | 1.00 | 1000 |
+
+> 行1占比 0.49%，toFixed 后为 0.00，完全不分摊折扣，所有折扣都由行2承担。
+
+**案例4：多微小行——累积效应显著**
+
+假设 100 行各 5 分（总计 500 分），整体折扣 10%（50 分）
+
+每行占比 = 5/500 = 1% → toFixed 后 = 0.01
+- 理论分摊：每行 0.5 分
+- 实际分摊：每行 Math.round(50 × 0.01) = Math.round(0.5) = 1 分（银行家舍入会有不同结果）
+- 100 行合计分摊：约 100 分（是实际的 2 倍）
+
+> 当行数众多且每行占比都接近 0.5% 时，舍入误差会累积放大。
+
+#### 2.4.7 舍入影响的传导路径
+
+```
+比例 toFixed(2) 舍入
+    ↓
+itemDiscount（行分摊折扣）偏差
+    ↓
+discountedTotal（分摊折扣后行金额）偏差
+    ↓
+行税金额偏差
+    ↓
+总税金额偏差
+```
+
+**影响范围**：
+- ✅ 仅影响**行税**的计算结果
+- ✅ 不影响**行总额**（`item.total` 不变）
+- ✅ 不影响**小计**（`sub_total` 不变）
+- ✅ 不影响**整体折扣值**（`discount_val` 不变）
+- ❌ 导致**行税之和**与**整体税模式下的总税**不一致
+
+#### 2.4.8 两次舍入的叠加
+
+`getTaxAmount()` 中存在两次舍入，叠加后误差可能放大：
+
+1. **比例舍入**：`proportion = (itemTotal / total).toFixed(2)`
+2. **金额舍入**：`itemDiscount = Math.round(discount * proportion)`
+
+再加上最终税计算的 `Math.round`，总共有三次舍入操作。
+
+---
+
+### 2.5 行级税计算分支执行顺序
 
 `CreateItemRowTax.vue` 中 `taxAmount` computed 的判断顺序：
 
@@ -515,49 +679,115 @@ const itemWiseTaxes = computed(() => {
 
 关键代码：`Invoice.php` 的 `createItems()` 和 `createTaxes()` 方法
 
-### 6.3 后端是否重算金额？——完全信任前端
+### 6.3 后端金额字段来源详析
 
-> **核心结论**：后端**完全信任**前端传过来的所有金额字段，不做任何重算、校验、核对。前端算多少，后端存多少。
+> **核心结论**：后端**完全信任**前端传过来的所有金额字段，不做任何业务逻辑重算、校验、核对。前端算多少，后端存多少。
 
-**证据链**：
+#### 6.3.1 Invoice 主表金额字段
 
-1. **Invoice 主表创建**：`createInvoice()` 中直接使用 `$request->getInvoicePayload()`，而 `getInvoicePayload()` 直接使用前端传来的 `total`、`sub_total`、`tax`、`discount_val` 等字段。
+| 字段 | 来源 | 后端是否重算 | 说明 |
+|-----|------|-------------|------|
+| `sub_total` | 前端直接传来 | ❌ 否 | 小计金额 |
+| `discount_val` | 前端直接传来 | ❌ 否 | 折扣值 |
+| `tax` | 前端直接传来 | ❌ 否 | 总税额 |
+| `total` | 前端直接传来 | ❌ 否 | 最终总额 |
+| `due_amount` | 前端 `total` 字段 | ❌ 否 | 直接使用 `$this->total` |
+| `base_sub_total` | 前端 `sub_total` × 汇率 | ⚠️ 仅汇率换算 | `$this->sub_total * $exchange_rate` |
+| `base_discount_val` | 前端 `discount_val` × 汇率 | ⚠️ 仅汇率换算 | `$this->discount_val * $exchange_rate` |
+| `base_tax` | 前端 `tax` × 汇率 | ⚠️ 仅汇率换算 | `$this->tax * $exchange_rate` |
+| `base_total` | 前端 `total` × 汇率 | ⚠️ 仅汇率换算 | `$this->total * $exchange_rate` |
+| `base_due_amount` | 前端 `total` × 汇率 | ⚠️ 仅汇率换算 | `$this->total * $exchange_rate` |
 
-   代码：`app/Http/Requests/InvoicesRequest.php` 的 `getInvoicePayload()` 方法：
-   ```php
-   return collect($this->except('items', 'taxes'))
-       ->merge([
-           // ...
-           'base_total' => $this->total * $exchange_rate,        // 直接用前端传的 total
-           'base_discount_val' => $this->discount_val * $exchange_rate,
-           'base_sub_total' => $this->sub_total * $exchange_rate,
-           'base_tax' => $this->tax * $exchange_rate,
-           // ...
-       ])
-   ```
+**代码证据**（`app/Http/Requests/InvoicesRequest.php` 的 `getInvoicePayload()`）：
+```php
+return collect($this->except('items', 'taxes'))
+    ->merge([
+        // ...
+        'due_amount' => $this->total,                              // 直接使用前端 total
+        'base_total' => $this->total * $exchange_rate,             // 仅汇率换算
+        'base_discount_val' => $this->discount_val * $exchange_rate,
+        'base_sub_total' => $this->sub_total * $exchange_rate,
+        'base_tax' => $this->tax * $exchange_rate,
+        'base_due_amount' => $this->total * $exchange_rate,
+        // ...
+    ])
+```
 
-2. **行项目创建**：`createItems()` 中直接 `$invoice->items()->create($invoiceItem)`，金额字段全部来自前端。
+#### 6.3.2 InvoiceItem 行项目金额字段
 
-3. **税创建**：`createTaxes()` 和 `createItems()` 中的行税创建，直接 `$item->taxes()->create($tax)`，`amount` 字段来自前端。
+| 字段 | 来源 | 后端是否重算 | 说明 |
+|-----|------|-------------|------|
+| `price` | 前端直接传来 | ❌ 否 | 单价 |
+| `quantity` | 前端直接传来 | ❌ 否 | 数量 |
+| `discount_val` | 前端直接传来 | ❌ 否 | 行折扣值 |
+| `tax` | 前端直接传来 | ❌ 否 | 行税合计 |
+| `total` | 前端直接传来 | ❌ 否 | 行总额 |
+| `base_price` | 前端 `price` × 汇率 | ⚠️ 仅汇率换算 | |
+| `base_discount_val` | 前端 `discount_val` × 汇率 | ⚠️ 仅汇率换算 | |
+| `base_tax` | 前端 `tax` × 汇率 | ⚠️ 仅汇率换算 | |
+| `base_total` | 前端 `total` × 汇率 | ⚠️ 仅汇率换算 | |
 
-4. **汇率换算仅乘以汇率**：后端唯一做的"计算"只有 `base_* = 金额 × exchange_rate`，完全是线性放大，不涉及业务逻辑重算。
+**代码证据**（`app/Models/Invoice.php` 的 `createItems()`）：
+```php
+foreach ($invoiceItems as $invoiceItem) {
+    $invoiceItem['company_id'] = $invoice->company_id;
+    $invoiceItem['exchange_rate'] = $exchange_rate;
+    $invoiceItem['base_price'] = $invoiceItem['price'] * $exchange_rate;
+    $invoiceItem['base_discount_val'] = $invoiceItem['discount_val'] * $exchange_rate;
+    $invoiceItem['base_tax'] = $invoiceItem['tax'] * $exchange_rate;
+    $invoiceItem['base_total'] = $invoiceItem['total'] * $exchange_rate;
+    // 直接 create，不校验
+    $item = $invoice->items()->create($invoiceItem);
+}
+```
+
+#### 6.3.3 Tax 税金额字段
+
+| 字段 | 来源 | 后端是否重算 | 说明 |
+|-----|------|-------------|------|
+| `amount` | 前端直接传来 | ❌ 否 | 税额 |
+| `percent` | 前端直接传来 | ❌ 否 | 税率快照 |
+| `base_amount` | 前端 `amount` × 汇率 | ⚠️ 仅汇率换算 | |
+
+**代码证据**（`app/Models/Invoice.php` 的 `createTaxes()` 和行税创建）：
+```php
+// 整体税创建
+$tax['base_amount'] = $tax['amount'] * $exchange_rate;
+$invoice->taxes()->create($tax);
+
+// 行级税创建
+$tax['base_amount'] = $tax['amount'] * $exchange_rate;
+$item->taxes()->create($tax);
+```
+
+#### 6.3.4 后端唯一的"计算"：汇率换算
+
+后端所有 `base_*` 字段都遵循同一模式：
+
+```
+base_字段 = 原字段 × exchange_rate
+```
+
+这是纯线性乘法运算，**不涉及任何业务逻辑重算**，不验证金额关系，不校验计算正确性。
 
 ### 6.4 安全边界与风险
 
 | 风险点 | 说明 | 影响程度 |
 |-------|------|---------|
-| 前端篡改金额 | 用户可以通过浏览器控制台修改任意金额字段 | ⚠️ 高 |
-| 计算不一致 | 前端不同入口计算结果可能与后端不一致（但后端不验证） | ⚠️ 中 |
-| 舍入误差累积 | 前端多次舍入后的值被直接存储 | ⚠️ 中 |
-| 汇率换算使用前端金额 | `base_*` 字段也基于前端金额计算 | ⚠️ 中 |
+| 前端篡改金额 | 用户可通过浏览器控制台修改任意金额字段，后端完全信任 | ⚠️ 高 |
+| 前端计算错误 | 前端 bug 导致的金额错误会被直接持久化 | ⚠️ 高 |
+| 舍入误差累积 | 前端多次舍入（`Math.round`、`toFixed`）后的值被直接存储 | ⚠️ 中 |
+| 汇率换算失真 | `base_*` 字段基于前端金额换算，若前端金额错，本位币也错 | ⚠️ 中 |
+| compound_tax 数据不一致 | 前端未携带 compound_tax，数据库永远为默认值 0 | ⚠️ 中 |
 
-**验证空白区**：
+**验证空白区**（完全没有校验）：
 
-- ❌ 没有验证 `sub_total - discount_val + tax = total` 是否成立
-- ❌ 没有验证 `items` 的 `total` 之和是否等于 `sub_total`
-- ❌ 没有验证 `taxes` 的 `amount` 之和是否等于 `tax`
-- ❌ 没有验证每个税的 `amount` 是否与税率计算结果一致
-- ❌ 没有验证行项目数量×单价是否等于行小计
+- ❌ 不验证 `sub_total - discount_val + tax = total` 是否成立
+- ❌ 不验证 `items` 的 `total` 之和是否等于 `sub_total`
+- ❌ 不验证 `taxes` 的 `amount` 之和是否等于 `tax`
+- ❌ 不验证每个税的 `amount` 是否与税率 × 税基计算结果一致
+- ❌ 不验证行项目 `price × quantity = 行小计`
+- ❌ 不验证 `compound_tax` 属性是否与 TaxType 配置一致
 
 ### 6.5 金额单位约定
 
