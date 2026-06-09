@@ -40,6 +40,70 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 - `calculation_type`：计算方式快照
 - `compound_tax`：是否复合税快照
 
+### 1.4 TaxType 选择后的字段传递链
+
+当用户在界面选择一个 TaxType 后，系统会将 TaxType 的部分属性快照到 Tax 实例中。但**字段携带情况如下：
+
+| 字段 | TaxType → Tax（整单税） | Tax（行级税） | 说明 |
+|-----|--------------------------|--------------|------|
+| `name` | ✅ 携带 | ✅ 携带 | 税种名称 |
+| `percent` | ✅ 携带 | ✅ 携带 | 税率百分比 |
+| `calculation_type` | ✅ 携带 | ✅ 携带 | 计算方式 |
+| `fixed_amount` | ✅ 携带 | ✅ 携带 | 固定税额 |
+| `tax_type_id` | ✅ 携带 | ✅ 携带 | 关联 ID |
+| `compound_tax` | ❌ **不携带** | ❌ **不携带** | 复合税标记 |
+
+> **重要发现**：新增税实例时，`compound_tax` 属性**未从 TaxType 复制过来，始终为 stub 默认值 `false`。这意味着即使在前端运行时的复合税标记实际上不会生效，因为  `compound_tax` 判断依赖 tax instance 上的属性，而非实时计算时都 `tax_type_id` 关联查询。
+
+**整单税新增代码**（`resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue` 的 `onSelectTax` 函数）：
+
+```javascript
+function onSelectTax(selectedTax) {
+  let amount = 0
+  // ... 计算 amount
+  let data = {
+    ...TaxStub,          // compound_tax 默认为 false
+    id: Guid.raw(),
+    name: selectedTax.name,
+    percent: selectedTax.percent,
+    tax_type_id: selectedTax.id,
+    amount,
+    calculation_type: selectedTax.calculation_type,
+    fixed_amount: selectedTax.fixed_amount
+    // ⚠️ 没有 compound_tax！
+  }
+  // ...
+}
+```
+
+**行级税新增代码**（`resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue` 的 `onSelectTax` 函数）：
+
+```javascript
+function onSelectTax(val) {
+  localTax.calculation_type = val.calculation_type
+  localTax.percent = val.calculation_type === 'percentage' ? val.percent : null
+  localTax.fixed_amount = val.calculation_type === 'fixed' ? val.fixed_amount : null
+  localTax.tax_type_id = val.id
+  localTax.name = val.name
+  // ⚠️没有 compound_tax！
+  //  localTax.compound_tax = val.compound_tax
+}
+```
+
+**Tax stub 默认值**（`resources/scripts/admin/stub/tax.js`）：
+```javascript
+export default {
+  name: '',
+  tax_type_id: 0,
+  type: 'GENERAL',
+  amount: null,
+  percent: null,
+  compound_tax: false,  // 始终为 false
+}
+```
+
+**数据库层面**：`taxes` 表有 `compound_tax` 字段（`database/migrations/2019_09_21_052548_create_taxes_table.php），默认值为 `0`。但 `app/Models/Tax.php` 的 `$casts` 中**未定义** `compound_tax` 的类型转换。
+
 ---
 
 ## 二、行级计算层
