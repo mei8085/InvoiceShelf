@@ -227,29 +227,40 @@ public static function make($data = []): Config
 
 ### 4.2 备份类型（option 参数）
 
-在 [CreateBackupJob@handle](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Jobs/CreateBackupJob.php#L35-L58) 中，根据 `option` 参数决定备份内容：
+在 [CreateBackupJob@handle](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Jobs/CreateBackupJob.php#L35-L58) 中，根据 `option` 参数决定备份内容和文件名。
 
-| option 值 | 备份内容 | 文件名前缀 |
-|-----------|---------|-----------|
-| 空值或 `full` | 数据库 + 文件 | 无（由 spatie 包自动命名） |
-| `only-db` | 仅数据库 | `only-db-` |
-| `only-files` | 仅文件 | `only-files-` |
+前端 [BackupModal.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/components/modal-components/BackupModal.vue#L105) 定义了三个选项：
+
+```js
+const options = reactive(['full', 'only-db', 'only-files'])
+```
+
+| option 值 | 备份内容 | 文件名格式示例 |
+|-----------|---------|--------------|
+| `full` | 数据库 + 文件 | `full-2024-01-15-10-30-00.zip` |
+| `only-db` | 仅数据库 | `only-db-2024-01-15-10-30-00.zip` |
+| `only-files` | 仅文件 | `only-files-2024-01-15-10-30-00.zip` |
+
+**关键代码逻辑**：
 
 ```php
+// 控制备份内容
 if ($this->data['option'] === 'only-db') {
-    $backupJob->dontBackupFilesystem();  // 跳过文件系统备份
+    $backupJob->dontBackupFilesystem();  // 仅数据库：跳过文件系统
 }
 
 if ($this->data['option'] === 'only-files') {
-    $backupJob->dontBackupDatabases();   // 跳过数据库备份
+    $backupJob->dontBackupDatabases();   // 仅文件：跳过数据库
 }
 
-// 仅当 option 非空时，才设置自定义文件名
+// 控制文件名：只要 option 非空，就设置自定义文件名
 if (! empty($this->data['option'])) {
     $prefix = str_replace('_', '-', $this->data['option']).'-';
     $backupJob->setFilename($prefix.date('Y-m-d-H-i-s').'.zip');
 }
 ```
+
+> **重要事实**：`full` 选项也会走 `! empty()` 判断（因为字符串 `'full'` 非空），所以 **full 备份也会设置自定义文件名前缀 `full-`**，不是使用 spatie 包的默认命名。只有当 option 参数完全不传或为空字符串时，才使用 spatie 默认命名。
 
 ### 4.3 清理策略（归档保留规则）
 
