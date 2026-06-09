@@ -655,7 +655,55 @@ window.InvoiceShelf.booting((app, router) => {
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 前端完整链路（浏览器侧）
+### 7.2 Bootstrap API 路径核准
+
+**重要结论**：Bootstrap 接口路径为 **`/api/v1/bootstrap`**，**没有** `admin` 前缀。
+
+| 项目 | 真实值 | 所在文件 |
+|------|--------|----------|
+| 前端请求路径 | `GET /api/v1/bootstrap` | [global.js](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/resources/scripts/admin/stores/global.js#L51) |
+| 后端路由定义 | `Route::get('/bootstrap', BootstrapController::class)` | [api.php](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/routes/api.php#L197) |
+| 路由中间件 | `auth:sanctum`, `company`, `bouncer` | [api.php](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/routes/api.php#L191-L192) |
+| 控制器命名空间 | `App\Http\Controllers\V1\Admin\General\BootstrapController` | [BootstrapController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/app/Http/Controllers/V1/Admin/General/BootstrapController.php) |
+
+> **容易混淆的点**：
+> - ✅ API 路径：`/api/v1/bootstrap`（没有 admin 前缀）
+> - ✅ 控制器目录：`V1/Admin/General/`（命名空间有 Admin）
+> - ✅ 前端页面路由：`/admin/dashboard`（有 admin 前缀）
+> - ✅ 菜单 link 字段：`/admin/dashboard`（与页面路由一致，有 admin 前缀）
+>
+> 命名空间的 `Admin` 只是代码组织方式，不反映在 URL 路径中。
+
+#### 路由结构详解
+
+在 [routes/api.php](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/routes/api.php) 中，路由层级为：
+
+```
+/api                          ← RouteServiceProvider 添加的 api 前缀
+  /v1                          ← api.php 中的 Route::prefix('/v1')
+    /bootstrap                 ← admin 端 bootstrap 接口（在 auth:sanctum + company + bouncer 中间件内）
+    /dashboard
+    /customers
+    /invoices
+    ...
+    /modules                   ← 模块管理相关接口
+      /
+      /{module}/enable
+      /{module}/disable
+      ...
+    /{company:slug}/customer   ← 客户端门户接口
+      /bootstrap               ← 客户端 bootstrap 接口
+      ...
+```
+
+两个 Bootstrap 接口对比：
+
+| 接口 | 路径 | 用途 | 菜单类型 |
+|------|------|------|----------|
+| 管理端 Bootstrap | `GET /api/v1/bootstrap` | 后台管理初始化数据 | `main_menu`, `setting_menu` |
+| 客户端 Bootstrap | `GET /api/v1/{company:slug}/customer/bootstrap` | 客户门户初始化数据 | `customer_portal_menu` |
+
+### 7.3 前端完整链路（浏览器侧）
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -665,6 +713,7 @@ window.InvoiceShelf.booting((app, router) => {
 │  解析 <head> 中的样式                                             │
 │    ├─ Vite 主样式                                                │
 │    └─ 模块样式（每个模块一个 <link>）                              │
+│       路径：/modules/styles/{name}                                │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
@@ -678,6 +727,7 @@ window.InvoiceShelf.booting((app, router) => {
 │        └─ bootingCallbacks = []                                  │
 │                                                                 │
 │  2. 模块脚本（每个启用模块一个）                                  │
+│     路径：/modules/scripts/{name}                                │
 │     └─ 模块脚本执行                                               │
 │        └─ window.InvoiceShelf.booting(callback)                  │
 │           └─ callback 被推入 bootingCallbacks 队列               │
@@ -694,8 +744,8 @@ window.InvoiceShelf.booting((app, router) => {
 │    │
 │    ├─ executeCallbacks()  ← 执行所有模块回调                     │
 │    │     ├─ 模块A回调(app, router)                               │
-│    │     │     ├─ 添加路由                                       │
-│    │     │     └─ 注册组件                                       │
+│    │     │     ├─ 添加路由（router.addRoute）                     │
+│    │     │     └─ 注册组件（app.component）                       │
 │    │     ├─ 模块B回调(app, router)                               │
 │    │     └─ ...                                                  │
 │    │
@@ -707,28 +757,140 @@ window.InvoiceShelf.booting((app, router) => {
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                 阶段 4：页面初始化与菜单渲染                      │
+│              阶段 4：LayoutBasic mounted + Bootstrap             │
 │                                                                 │
-│  LayoutBasic 组件 created/mounted                                │
+│  LayoutBasic 组件 onMounted                                       │
 │    │
-│    └─ globalStore.bootstrap()  ← 调用 Bootstrap API              │
+│    └─ globalStore.bootstrap()  ← 发起 Bootstrap 请求             │
 │          │
-│          ├─ 请求 GET /api/v1/admin/bootstrap                     │
+│          ├─ HTTP 请求：GET /api/v1/bootstrap                     │
+│          │   (axios 实例，相对路径，无 baseURL)                    │
+│          │   请求头：Authorization, company                      │
 │          │
-│          ├─ 响应中包含：                                          │
-│          │     ├─ main_menu: [...]  ← 菜单数据                  │
-│          │     ├─ setting_menu: [...]                            │
-│          │     └─ modules: ["ModuleA", "ModuleB"]  ← 启用模块   │
+│          │                                    ┌──────────────┐  │
+│          │                                    │   后端处理    │  │
+│          │                                    │  Bootstrap   │  │
+│          │                                    │ Controller   │  │
+│          │                                    │  生成菜单数据  │  │
+│          │                                    └──────┬───────┘  │
+│          │                                           │          │
+│          ├─ 响应 JSON（部分关键字段）                  │          │
+│          │     ├─ main_menu: [...]                    │          │
+│          │     │   每项：{title, link, icon,          │          │
+│          │     │          name, group}                │          │
+│          │     ├─ setting_menu: [...]                 │          │
+│          │     └─ modules: ["ModuleA", ...]           │          │
 │          │
-│          ├─ mainMenu 存入 globalStore                            │
-│          ├─ settingMenu 存入 globalStore                         │
-│          └─ enableModules 存入 moduleStore                       │
+│          ├─ this.mainMenu = response.data.main_menu   │
+│          ├─ this.settingMenu = response.data.setting_menu
+│          └─ moduleStore.enableModules = response.data.modules
 │                                                                 │
-│  TheSiteSidebar 组件渲染                                         │
-│    └─ 遍历 globalStore.menuGroups                                │
-│         └─ 渲染每个菜单项 router-link                            │
+│  TheSiteSidebar 组件渲染（响应式）                               │
+│    └─ globalStore.menuGroups                                    │
+│       (getter: _.groupBy(mainMenu, 'group'))                   │
+│       └─ 每组渲染一个 <nav>                                      │
+│            └─ 每项渲染 <router-link :to="item.link">            │
+│               （item.link 如 /admin/dashboard，带 admin 前缀）   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### 7.4 菜单数据流向详解（从数据库到侧边栏）
+
+菜单数据经过 **6 层转换** 才最终渲染到页面上：
+
+```
+  第 1 层          第 2 层          第 3 层          第 4 层
+配置数组  ───▶  Menu 对象  ───▶  Bootstrap  ───▶  Pinia Store
+config/invoiceshelf.php   lavary/menu       控制器 JSON       global store
+                              items
+
+  第 5 层          第 6 层
+menuGroups  ───▶  <router-link>
+getter 计算         侧边栏渲染
+```
+
+各层详细说明：
+
+| 层级 | 数据形态 | 所在位置 | 关键操作 |
+|------|----------|----------|----------|
+| **第 1 层：配置源** | PHP 数组 | [config/invoiceshelf.php](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/config/invoiceshelf.php#L308) 的 `main_menu` | 静态定义菜单项的完整属性 |
+| **第 2 层：Menu 对象** | `Lavary\Menu\Menu` 实例 | AppServiceProvider boot 阶段的 `\Menu::make('main_menu', ...)` | 从配置创建菜单对象，支持动态追加 |
+| **第 3 层：API 输出** | JSON 数组 | [BootstrapController](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/app/Http/Controllers/V1/Admin/General/BootstrapController.php#L32-L34) 的 `generateMenu()` | 权限过滤，只返回用户有权限的菜单项 |
+| **第 4 层：Pinia State** | JS 数组 | [global.js](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/resources/scripts/admin/stores/global.js#L30-L31) 的 `mainMenu` | 前端状态存储，响应式 |
+| **第 5 层：Getter 分组** | 按 group 分组的二维数组 | [global.js](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/resources/scripts/admin/stores/global.js#L42-L44) 的 `menuGroups` | `_.groupBy(state.mainMenu, 'group')` 按组归类 |
+| **第 6 层：侧边栏渲染** | Vue 组件 | [TheSiteSidebar.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/resources/scripts/admin/layouts/partials/TheSiteSidebar.vue#L74-L103) | 双层 v-for 渲染，生成 `<router-link>` |
+
+#### 每层的数据结构示例
+
+**第 1 层（配置）**：
+```php
+// config/invoiceshelf.php
+[
+    'title' => 'navigation.dashboard',
+    'group' => 1,
+    'link' => '/admin/dashboard',
+    'icon' => 'HomeIcon',
+    'name' => 'Dashboard',
+    'owner_only' => false,
+    'ability' => 'dashboard',
+    'model' => '',
+]
+```
+
+**第 2 层（Menu 对象）**：
+```php
+// 通过 Menu::get('main_menu')->items 访问
+// Item 对象属性：title, link, data(icon/name/group/...)
+```
+
+**第 3 层（API JSON）**：
+```json
+{
+  "main_menu": [
+    {
+      "title": "navigation.dashboard",
+      "link": "/admin/dashboard",
+      "icon": "HomeIcon",
+      "name": "Dashboard",
+      "group": 1
+    }
+  ]
+}
+```
+
+**第 4-6 层（前端）**：
+```javascript
+// state.mainMenu (第4层)
+[{ title: 'navigation.dashboard', link: '/admin/dashboard', icon: 'HomeIcon', name: 'Dashboard', group: 1 }, ...]
+
+// getters.menuGroups (第5层)
+[
+  [ /* group 1 的菜单项 */ ],
+  [ /* group 2 的菜单项 */ ],
+  [ /* group 3 的菜单项 */ ],
+]
+
+// 渲染结果 (第6层)
+// <nav> 包裹每组，内部是多个 <router-link>
+```
+
+### 7.5 关键节点对照表
+
+| 节点 | 后端位置 | 前端位置 |
+|------|----------|----------|
+| 模块文件被发现 | nwidart 主 SP boot 阶段 | - |
+| 模块 SP 被注册 | nwidart 主 SP boot 阶段 | - |
+| 前端资源被注册 | 模块 SP boot 阶段（Module::script） | - |
+| 菜单被创建 | AppServiceProvider boot 阶段，`addMenus()` | - |
+| 模块菜单被合并 | 模块 SP boot 阶段（配置合并） | - |
+| HTML 注入资源标签 | 视图渲染阶段 | HTML 解析阶段 |
+| 模块脚本执行 | - | 脚本加载阶段 |
+| 模块回调注册 | - | `InvoiceShelf.booting()` 调用时 |
+| 模块路由/组件生效 | - | `start()` → `executeCallbacks()` |
+| Bootstrap API 请求 | `GET /api/v1/bootstrap` | `globalStore.bootstrap()` |
+| 菜单数据到达前端 | Bootstrap 控制器返回 | axios 响应 |
+| 菜单存入 Store | - | `this.mainMenu = response.data.main_menu` |
+| 菜单渲染到页面 | - | TheSiteSidebar.vue 中 v-for 渲染 |
 
 ### 7.3 关键节点对照表
 
