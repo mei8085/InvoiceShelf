@@ -42,7 +42,7 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 
 ### 1.4 TaxType 选择后的字段传递链
 
-当用户在界面选择一个 TaxType 后，系统会将 TaxType 的部分属性快照到 Tax 实例中。但**字段携带情况如下：
+当用户在界面选择一个 TaxType 后，系统会将 TaxType 的部分属性快照到 Tax 实例中。字段携带情况如下：
 
 | 字段 | TaxType → Tax（整单税） | Tax（行级税） | 说明 |
 |-----|--------------------------|--------------|------|
@@ -53,44 +53,18 @@ InvoiceShelf 的发票金额计算体系分为三层：**税率配置层** → *
 | `tax_type_id` | ✅ 携带 | ✅ 携带 | 关联 ID |
 | `compound_tax` | ❌ **不携带** | ❌ **不携带** | 复合税标记 |
 
-> **重要发现**：新增税实例时，`compound_tax` 属性**未从 TaxType 复制过来，始终为 stub 默认值 `false`。这意味着即使在前端运行时的复合税标记实际上不会生效，因为  `compound_tax` 判断依赖 tax instance 上的属性，而非实时计算时都 `tax_type_id` 关联查询。
+### 1.5 TaxStub 来源与导入 Bug
 
-**整单税新增代码**（`resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue` 的 `onSelectTax` 函数）：
+#### 1.5.1 行级税使用正确的 TaxStub
 
-```javascript
-function onSelectTax(selectedTax) {
-  let amount = 0
-  // ... 计算 amount
-  let data = {
-    ...TaxStub,          // compound_tax 默认为 false
-    id: Guid.raw(),
-    name: selectedTax.name,
-    percent: selectedTax.percent,
-    tax_type_id: selectedTax.id,
-    amount,
-    calculation_type: selectedTax.calculation_type,
-    fixed_amount: selectedTax.fixed_amount
-    // ⚠️ 没有 compound_tax！
-  }
-  // ...
-}
-```
-
-**行级税新增代码**（`resources/scripts/admin/components/estimate-invoice-common/CreateItemRowTax.vue` 的 `onSelectTax` 函数）：
+行级税的 stub 来源正确，来自 `resources/scripts/admin/stub/tax.js`：
 
 ```javascript
-function onSelectTax(val) {
-  localTax.calculation_type = val.calculation_type
-  localTax.percent = val.calculation_type === 'percentage' ? val.percent : null
-  localTax.fixed_amount = val.calculation_type === 'fixed' ? val.fixed_amount : null
-  localTax.tax_type_id = val.id
-  localTax.name = val.name
-  // ⚠️没有 compound_tax！
-  //  localTax.compound_tax = val.compound_tax
-}
+// CreateItemRow.vue 中的导入
+import TaxStub from '@/scripts/admin/stub/tax'
 ```
 
-**Tax stub 默认值**（`resources/scripts/admin/stub/tax.js`）：
+**Tax stub 默认值**：
 ```javascript
 export default {
   name: '',
@@ -98,11 +72,78 @@ export default {
   type: 'GENERAL',
   amount: null,
   percent: null,
-  compound_tax: false,  // 始终为 false
+  compound_tax: false,  // 明确为 false
 }
 ```
 
-**数据库层面**：`taxes` 表有 `compound_tax` 字段（`database/migrations/2019_09_21_052548_create_taxes_table.php），默认值为 `0`。但 `app/Models/Tax.php` 的 `$casts` 中**未定义** `compound_tax` 的类型转换。
+#### 1.5.2 整单税的 TaxStub 导入错误（Bug）
+
+> **严重 Bug**：`CreateTotal.vue` 中导入的 `TaxStub` 实际上是 `abilities.js`（权限常量对象），而不是 `tax.js`！
+
+**错误导入代码**（`resources/scripts/admin/components/estimate-invoice-common/CreateTotal.vue`）：
+```javascript
+import TaxStub from '@/scripts/admin/stub/abilities'  // ⚠️ 错误！导入了权限常量
+```
+
+`abilities.js` 的内容是权限字符串常量的对象，例如：
+```javascript
+export default {
+  DASHBOARD: 'dashboard',
+  CREATE_CUSTOMER: 'create-customer',
+  CREATE_TAX_TYPE: 'create-tax-type',
+  // ... 共几十个权限字符串
+}
+```
+
+#### 1.5.3 导入错误的实际影响
+
+在 `onSelectTax()` 函数中：
+
+```javascript
+let data = {
+  ...TaxStub,           // 展开的是 abilities 对象
+  id: Guid.raw(),
+  name: selectedTax.name,
+  percent: selectedTax.percent,
+  tax_type_id: selectedTax.id,
+  amount,
+  calculation_type: selectedTax.calculation_type,
+  fixed_amount: selectedTax.fixed_amount
+  // ⚠️ 没有 compound_tax！
+}
+```
+
+**影响分析**：
+
+| 影响点 | 具体说明 | 严重程度 |
+|-------|---------|---------|
+| `compound_tax` 缺失 | 新增整单税时，`compound_tax` 字段完全不存在（不是 `false`，是 `undefined`），导致复合税功能完全失效 | ⚠️ 高 |
+| 多余属性混入 | tax 对象上会多出几十个权限常量属性（如 `DASHBOARD`、`CREATE_CUSTOMER` 等），但不会影响功能 | ⚠️ 低 |
+| 类型安全破坏 | 本应是 Tax 类型的对象混入了大量无关属性，污染数据结构 | ⚠️ 中 |
+
+#### 1.5.4 compound_tax 缺失对整单税的具体影响
+
+`CreateTotalTaxes.vue` 中判断复合税的逻辑：
+```javascript
+if (props.tax.compound_tax && props.store.getSubtotalWithDiscount) {
+  // 复合税计算
+}
+```
+
+由于新增的 tax 对象上 `compound_tax` 是 `undefined`（甚至不是 `false`），`undefined && ...` 结果为 falsy，复合税分支永远不会执行。
+
+**后果**：
+- 所有新增的整单税都被当作简单税处理
+- 即使在 TaxType 中配置了 `compound_tax = true`，添加到整单后也不会按复合税计算
+- 只有从后端加载的已有数据（数据库中 `compound_tax = 1`）才可能触发复合税逻辑
+
+### 1.6 数据库与模型层面
+
+**数据库表**：`taxes` 表有 `compound_tax` 字段（见 `database/migrations/2019_09_21_052548_create_taxes_table.php），类型为 `tinyInteger`，默认值为 `0`。
+
+**模型层**：`app/Models/Tax.php` 的 `$casts` 中**未定义** `compound_tax` 的类型转换，读取时默认为 `integer` 类型的 `0` 或 `1`。
+
+**保存行为**：由于 `Tax` 模型使用 `$guarded = ['id']`（非 `$fillable`），前端传来的所有字段都会被保存，包括 `compound_tax`。但由于前端根本没传这个字段，数据库中该字段永远是默认值 `0`。
 
 ---
 
@@ -461,6 +502,8 @@ const itemWiseTaxes = computed(() => {
 - `items[].taxes[]`：行税种明细
 - `taxes[]`：整体税种明细
 
+请求验证在 `app/Http/Requests/InvoicesRequest.php` 的 `rules()` 方法中，仅做字段存在性和类型校验，**不校验金额的计算逻辑正确性**。
+
 ### 6.2 后端存储
 
 后端在 `app/Models/Invoice.php` 的 `createInvoice()` 和 `createItems()` 方法中存储：
@@ -472,7 +515,51 @@ const itemWiseTaxes = computed(() => {
 
 关键代码：`Invoice.php` 的 `createItems()` 和 `createTaxes()` 方法
 
-### 6.3 金额单位约定
+### 6.3 后端是否重算金额？——完全信任前端
+
+> **核心结论**：后端**完全信任**前端传过来的所有金额字段，不做任何重算、校验、核对。前端算多少，后端存多少。
+
+**证据链**：
+
+1. **Invoice 主表创建**：`createInvoice()` 中直接使用 `$request->getInvoicePayload()`，而 `getInvoicePayload()` 直接使用前端传来的 `total`、`sub_total`、`tax`、`discount_val` 等字段。
+
+   代码：`app/Http/Requests/InvoicesRequest.php` 的 `getInvoicePayload()` 方法：
+   ```php
+   return collect($this->except('items', 'taxes'))
+       ->merge([
+           // ...
+           'base_total' => $this->total * $exchange_rate,        // 直接用前端传的 total
+           'base_discount_val' => $this->discount_val * $exchange_rate,
+           'base_sub_total' => $this->sub_total * $exchange_rate,
+           'base_tax' => $this->tax * $exchange_rate,
+           // ...
+       ])
+   ```
+
+2. **行项目创建**：`createItems()` 中直接 `$invoice->items()->create($invoiceItem)`，金额字段全部来自前端。
+
+3. **税创建**：`createTaxes()` 和 `createItems()` 中的行税创建，直接 `$item->taxes()->create($tax)`，`amount` 字段来自前端。
+
+4. **汇率换算仅乘以汇率**：后端唯一做的"计算"只有 `base_* = 金额 × exchange_rate`，完全是线性放大，不涉及业务逻辑重算。
+
+### 6.4 安全边界与风险
+
+| 风险点 | 说明 | 影响程度 |
+|-------|------|---------|
+| 前端篡改金额 | 用户可以通过浏览器控制台修改任意金额字段 | ⚠️ 高 |
+| 计算不一致 | 前端不同入口计算结果可能与后端不一致（但后端不验证） | ⚠️ 中 |
+| 舍入误差累积 | 前端多次舍入后的值被直接存储 | ⚠️ 中 |
+| 汇率换算使用前端金额 | `base_*` 字段也基于前端金额计算 | ⚠️ 中 |
+
+**验证空白区**：
+
+- ❌ 没有验证 `sub_total - discount_val + tax = total` 是否成立
+- ❌ 没有验证 `items` 的 `total` 之和是否等于 `sub_total`
+- ❌ 没有验证 `taxes` 的 `amount` 之和是否等于 `tax`
+- ❌ 没有验证每个税的 `amount` 是否与税率计算结果一致
+- ❌ 没有验证行项目数量×单价是否等于行小计
+
+### 6.5 金额单位约定
 
 - 数据库存储：**分**（integer）
 - 前端输入展示：**元**（float）
