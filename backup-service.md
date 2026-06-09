@@ -487,14 +487,168 @@ public static function setFilesystem($credentials, $driver)
 4. 将其设为默认文件系统
 5. 备份目标磁盘也设置为这个动态磁盘
 
-**在 BackupConfigurationFactory 中的调用**：
-```php
-$fileDisk = FileDisk::find($data['file_disk_id']);
-$fileDisk->setConfig();
+---
 
-$prefix = env('DYNAMIC_DISK_PREFIX', 'temp_');
-config(['backup.backup.destination.disks' => [$prefix.$fileDisk->driver]]);
+### 4.5 各备份操作的目标磁盘差异（重要！）
+
+这是备份服务最容易踩坑的地方：**前端给所有接口都传了 `file_disk_id`，但后端只有部分接口使用了它，各操作的目标磁盘不一致。**
+
+#### 四个接口的磁盘处理对比
+
+| 操作 | 前端传 file_disk_id | 后端是否使用 | 目标磁盘 | 代码位置 |
+|------|---------------------|-------------|---------|---------|
+| 获取列表 | ✅ 传 | ✅ 是 | 动态磁盘（按 file_disk_id） | [BackupsController@index:31-39](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L31-L39) |
+| 创建备份 | ✅ 传 | ✅ 是（队列中） | 动态磁盘（按 file_disk_id） | [CreateBackupJob](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Jobs/CreateBackupJob.php) → [BackupConfigurationFactory](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Space/BackupConfigurationFactory.php) |
+| 删除备份 | ✅ 传 | ❌ **完全忽略** | 系统默认文件系统（local） | [BackupsController@destroy:100](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L100) |
+| 下载备份 | ✅ 传 | ❌ **完全忽略** | 系统默认文件系统（local） | [DownloadBackupController:24](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/DownloadBackupController.php#L24) |
+
+#### 逐接口代码对照
+
+**（1）列表接口 — 正确使用动态磁盘**
+
+[BackupsController@index:31-39](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L31-L39)
+
+```php
+if ($request->file_disk_id) {          // 有 file_disk_id 才走动态配置
+    $fileDisk = FileDisk::find($request->file_disk_id);
+    if ($fileDisk) {                   // 找到了才设置
+        $fileDisk->setConfig();        // ← 动态设置文件系统
+        $prefix = env('DYNAMIC_DISK_PREFIX', 'temp_');
+        config(['backup.backup.destination.disks' => [$prefix.$fileDisk->driver]]);
+    }
+}
+// 然后用 config('filesystems.default') 创建 BackupDestination
 ```
+
+> 列表接口的处理是完整的：有 ID → 查记录 → 找到了才设配置 → 用动态磁盘。
+
+**（2）创建备份 — 在队列中使用动态磁盘**
+
+不是在控制器里设置，而是把 `file_disk_id` 传给队列任务，由 `BackupConfigurationFactory` 在队列执行时设置。详见第三章的分析。
+
+**（3）删除接口 — 完全忽略 file_disk_id**
+
+[BackupsController@destroy:92-110](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/BackupsController.php#L92-L110)
+
+```php
+public function destroy($disk, Request $request)
+{
+    $this->authorize('manage backups');
+
+    $validated = $request->validate([
+        'path' => ['required', new PathToZip],  // ← 只校验 path
+    ]);
+
+    // 直接用默认文件系统创建！没有调用 setConfig()
+    $backupDestination = BackupDestination::create(
+        config('filesystems.default'),  // ← 用的是系统默认
+        config('backup.backup.name')
+    );
+
+    $backupDestination->backups()
+        ->first(fn (Backup $backup) => $backup->path() === $validated['path'])
+        ->delete();
+
+    return $this->respondSuccess();
+}
+```
+
+> **关键事实**：
+> - 路由参数 `$disk` 完全没用到（连变量都没读取）
+> - `$request->file_disk_id` 也完全没用到
+> - 直接用 `config('filesystems.default')`，也就是 `local` 磁盘
+> - 也就是说：不管你在前端选的是哪个磁盘，删除的永远是本地磁盘上的文件
+
+**（4）下载接口 — 同样完全忽略 file_disk_id**
+
+[DownloadBackupController:16-35](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/app/Http/Controllers/V1/Admin/Backup/DownloadBackupController.php#L16-L35)
+
+```php
+public function __invoke(Request $request)
+{
+    $this->authorize('manage backups');
+
+    $validated = $request->validate([
+        'path' => ['required', new PathToZip],  // ← 只校验 path
+    ]);
+
+    // 同样直接用默认文件系统
+    $backupDestination = BackupDestination::create(
+        config('filesystems.default'),  // ← 系统默认
+        config('backup.backup.name')
+    );
+
+    $backup = $backupDestination->backups()->first(
+        fn (Backup $backup) => $backup->path() === $validated['path']
+    );
+
+    // ... 下载流
+}
+```
+
+> 和删除接口一模一样的问题：完全忽略 `file_disk_id`，永远从本地磁盘下载。
+
+#### 前端的传参方式
+
+前端 [BackupSetting.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/121-InvoiceShelf/resources/scripts/admin/views/settings/BackupSetting.vue) 给每个操作都传了 `file_disk_id`：
+
+```js
+// 列表查询
+async function fetchBackupsData({ page, filter, sort }) {
+  let data = {
+    disk: filters.selected_disk.driver,
+    file_disk_id: filters.selected_disk.id,  // ← 传了
+  }
+  let response = await backupStore.fetchBackups(data)
+}
+
+// 删除
+function onRemoveBackup(backup) {
+  let data = {
+    disk: filters.selected_disk.driver,
+    file_disk_id: filters.selected_disk.id,  // ← 传了
+    path: backup.path,
+  }
+  let response = await backupStore.removeBackup(data)
+}
+
+// 下载
+function onDownloadBckup(backup) {
+  window.axios({
+    method: 'GET',
+    url: '/api/v1/download-backup',
+    params: {
+      disk: filters.selected_disk.driver,
+      file_disk_id: filters.selected_disk.id,  // ← 传了
+      path: backup.path,
+    },
+  })
+}
+```
+
+前端的逻辑是一致的——哪个磁盘上的列表，就在哪个磁盘上删除/下载。但后端没跟上。
+
+#### 这个不一致导致的问题
+
+| 场景 | 表现 |
+|------|------|
+| 用户选了 S3 磁盘，看到 S3 上的备份列表 | ✅ 正常 |
+| 用户在 S3 磁盘上创建备份 | ✅ 正常（队列中设置了动态磁盘） |
+| 用户在 S3 磁盘列表上点「下载」 | ❌ 找不到文件！因为从本地磁盘找 |
+| 用户在 S3 磁盘列表上点「删除」 | ❌ 删不掉！因为删的是本地磁盘上的 |
+| 如果本地磁盘正好有同名文件 | ❗ 可能删错/下错文件（虽然概率很低，因为有时间戳） |
+
+> **简单说**：列表看得到的，下载和删除都操作不到；下载删除能操作到的，列表里看不到（除非正好是本地磁盘）。
+
+#### 各接口处理方式总结表
+
+| 接口 | 有没有 file_disk_id 参数 | 有没有调用 setConfig | 有没有改 backup.destination.disks | 用的是哪个磁盘 |
+|------|------------------------|---------------------|--------------------------------|--------------|
+| index | ✅ 有 | ✅ 有 | ✅ 有 | 动态磁盘 |
+| store（控制器） | ✅ 有 | ❌ 没有 | ❌ 没有 | 队列中处理 |
+| store（队列中） | ✅ 有（data 里带的） | ✅ 有 | ✅ 有 | 动态磁盘 |
+| destroy | ✅ 有（请求参数里） | ❌ **没有** | ❌ **没有** | 系统默认（local） |
+| download | ✅ 有（请求参数里） | ❌ **没有** | ❌ **没有** | 系统默认（local） |
 
 ---
 
@@ -742,3 +896,15 @@ A: 不会自动清理。虽然配置了清理策略，但项目代码中没有�
 
 **Q: `config('backup.queue.name')` 配置在哪里？**
 A: 这个配置项不存在。`backup.php` 中没有 `queue.name` 配置，调用它会返回 `null`，导致任务被推送到默认队列。
+
+**Q: 前端有哪些校验？后端有哪些校验？**
+A: 前端有五层防护：默认值初始化 → 下拉组件约束（不可取消） → vuelidate required 规则 → 提交前 $touch 校验拦截 → 组装数据调用 API。后端 store 接口只有权限校验，完全没有参数校验。真正的业务校验在队列里的 BackupConfigurationFactory，而且还不完整（没检查 file_disk_id 有效性）。
+
+**Q: 传一个不存在的 file_disk_id 会怎么样？**
+A: 会导致 PHP Fatal Error。`BackupConfigurationFactory` 只检查了 `file_disk_id` 不为空，但没有检查 `FileDisk::find()` 的结果是不是 null。找不到记录的话，`$fileDisk->setConfig()` 会直接报错："Call to a member function setConfig() on null"。
+
+**Q: option 参数可以传任意字符串吗？有安全问题吗？**
+A: 后端没有白名单校验，传什么字符串都会被用作文件名前缀。前端是下拉选择所以不会有问题，但如果绕过前端直接调用 API，可以传任意值。虽然用作文件名前缀的风险相对可控（因为会拼上时间戳），但理论上存在路径遍历的潜在风险。
+
+**Q: file_disk_id 为空和无效，哪个后果更严重？**
+A: 无效更严重。为空是正常的 Exception，队列任务失败但系统没事。无效是 Fatal Error，可能影响队列 Worker 的稳定性。按说应该反过来才对——无效 ID 至少应该优雅地抛异常。
