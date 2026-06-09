@@ -85,7 +85,7 @@ return [
 
 ### 3.1 Laravel 服务提供者生命周期
 
-Laravel 的服务提供者分为两个阶段：
+Laravel 的服务提供者分为两个核心阶段，所有服务提供者严格按照**注册顺序**依次执行：
 
 ```
 请求到达
@@ -93,7 +93,7 @@ Laravel 的服务提供者分为两个阶段：
    ▼
 register 阶段（按注册顺序）
    ├─ 所有 SP 的 register() 依次执行
-   └─ 功能：绑定服务到容器
+   └─ 功能：绑定服务到容器、合并配置
    │
    ▼
 boot 阶段（按注册顺序）
@@ -102,91 +102,281 @@ boot 阶段（按注册顺序）
    │
    ▼
 应用已启动（booted）
+   └─ 触发 app.booted 回调
    │
    ▼
 路由匹配 → 中间件 → 控制器 → 响应
 ```
 
-### 3.2 nwidart 模块服务提供者的注册时机
+> **核心原则**：注册顺序决定执行顺序。先注册的 SP，其 register 和 boot 都先执行。
 
-nwidart 主服务提供者（`ModulesServiceProvider`）通过 package discovery 自动注册，**早于**应用服务提供者。
+### 3.2 nwidart 主服务提供者的发现与注册
 
-在 Laravel 11+ 中，服务提供者的注册顺序大致为：
+#### 3.2.1 底层包来源
+
+InvoiceShelf 通过 `invoiceshelf/modules` 包引入 nwidart/laravel-modules 框架，见 [composer.json](file:///d:/fz/0508-2/solo-dogfeeding/code/122-InvoiceShelf/composer.json#L17)。
+
+这个包在 `composer.json` 的 `extra.laravel` 中声明了自动发现配置：
+
+```json
+{
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Nwidart\\Modules\\LaravelModulesServiceProvider"
+      ],
+      "aliases": {
+        "Module": "Nwidart\\Modules\\Facades\\Module"
+      }
+    }
+  }
+}
+```
+
+#### 3.2.2 自动发现流程
+
+Laravel 的 **Package Discovery** 机制在 `post-autoload-dump` 事件中自动发现并缓存包的服务提供者：
+
+```
+composer install/update
+   │
+   ▼
+post-autoload-dump
+   │
+   ▼
+Illuminate\Foundation\ComposerScripts::postAutoloadDump
+   │
+   ▼
+php artisan package:discover
+   │
+   ▼
+扫描 vendor/*/*/composer.json
+   │
+   ▼
+收集 extra.laravel.providers
+   │
+   ▼
+写入 bootstrap/cache/packages.php
+```
+
+#### 3.2.3 注册时机
+
+在每个请求开始时，Laravel 从缓存中读取所有包的服务提供者并注册。注册顺序为：
 
 ```
 1. 框架核心服务提供者
-2. Package Discovery 发现的包服务提供者（nwidart 属于这一类）
+   └─ 如 AuthServiceProvider, RouteServiceProvider 等
+
+2. Package Discovery 发现的包服务提供者
+   ├─ Nwidart\Modules\LaravelModulesServiceProvider  ← 模块框架主 SP
+   └─ Lavary\Menu\ServiceProvider                    ← 菜单系统 SP
+
 3. bootstrap/providers.php 中的应用服务提供者
+   ├─ AppServiceProvider
+   ├─ RouteServiceProvider
+   └─ ... 其他应用 SP
 ```
 
-**因此，nwidart 主 SP 的 register 和 boot 都早于 AppServiceProvider。**
+**确认**：nwidart 主 SP 的 register 和 boot **都早于** AppServiceProvider。
 
-### 3.3 模块 SP 的注册与 boot 时机
+### 3.3 nwidart 主 SP 的 register 阶段
 
-nwidart 主 SP 在 **boot 阶段**扫描并启动所有启用的模块：
+`LaravelModulesServiceProvider::register()` 阶段主要做以下事情：
+
+```
+register() 阶段
+   ├─ 注册模块仓库（ModuleRepository）
+   │     └─ 负责模块的发现、查找、状态管理
+   │
+   ├─ 注册 Facade（Module 门面）
+   │     └─ Nwidart\Modules\Facades\Module
+   │
+   ├─ 注册 Artisan 命令
+   │     ├─ module:make
+   │     ├─ module:enable
+   │     ├─ module:disable
+   │     └─ ... 其他模块命令
+   │
+   ├─ 合并配置文件
+   │     └─ 将包的默认配置合并到 config('modules')
+   │
+   └─ 注册激活器（Activator）
+         └─ FileActivator — 管理模块启用状态
+```
+
+> **关键点**：register 阶段只注册基础设施，**不扫描和启动模块**。模块的发现和启动发生在 boot 阶段。
+
+### 3.4 nwidart 主 SP 的 boot 阶段 — 模块发现与启动
+
+这是模块框架最核心的阶段，也是模块服务提供者被加入 Laravel 的过程。
+
+#### 3.4.1 完整流程
 
 ```
 nwidart 主 SP boot 开始
    │
-   ├─ 扫描 Modules/ 目录
-   ├─ 读取 modules_statuses.json 状态
+   ├─ 1. 获取模块仓库（$this->app['modules']）
    │
-   └─ 对每个启用的模块：
-        │
-        ├─ $module->register()
-        │     └─ 注册模块的服务提供者（调用 $app->register()）
-        │           └─ 执行模块 SP 的 register() 方法
-        │
-        └─ $module->boot()
-              └─ 执行模块 SP 的 boot() 方法
+   ├─ 2. 扫描模块目录
+   │     └─ 读取 config('modules.paths.modules')
+   │           └─ 默认是 base_path('Modules')
+   │
+   ├─ 3. 为每个目录创建 Module 实例
+   │     ├─ 解析 module.json 获取元数据
+   │     ├─ 确定模块命名空间
+   │     └─ 确定模块服务提供者类名
+   │
+   ├─ 4. 检查模块启用状态
+   │     └─ 通过 FileActivator 读取 modules_statuses.json
+   │
+   └─ 5. 对每个启用的模块，依次执行：
+           │
+           ├─ 5a. $module->register()
+           │     │
+           │     ├─ 注册模块的服务提供者
+           │     │     └─ $app->register($providerClass)
+           │     │           └─ 执行模块 SP 的 register() 方法
+           │     │
+           │     └─ 注册模块的命名空间、别名等
+           │
+           └─ 5b. $module->boot()
+                 │
+                 ├─ 调用模块 SP 的 boot() 方法
+                 │     ├─ 加载路由（loadRoutesFrom）
+                 │     ├─ 加载视图（loadViewsFrom）
+                 │     ├─ 加载迁移（loadMigrationsFrom）
+                 │     ├─ 加载翻译（loadTranslationsFrom）
+                 │     ├─ Module::script()  ← 注册前端脚本
+                 │     ├─ Module::style()   ← 注册前端样式
+                 │     └─ ... 其他模块启动逻辑
+                 │
+                 └─ 触发模块启动事件
 ```
 
-### 3.4 完整时序图（后端启动阶段）
+#### 3.4.2 模块服务提供者是如何被加入 Laravel 的
+
+关键代码路径（概念性）：
+
+```php
+// 在 nwidart 主 SP 的 boot 阶段
+public function boot()
+{
+    $modules = $this->app['modules'];
+
+    foreach ($modules->getEnabled() as $module) {
+        // 注册模块服务提供者 — 这是关键一步
+        $this->app->register($module->getServiceProvider());
+        
+        // 然后执行 boot（实际上 Laravel 会在 register 时按顺序 boot）
+    }
+}
+```
+
+> **重要**：当调用 `$app->register($provider)` 时，如果应用已经在 boot 阶段或之后，Laravel 会**立即**执行该 SP 的 `boot()` 方法，而不是等到下一轮。
+
+#### 3.4.3 时序确认
+
+由于 nwidart 主 SP 的 boot 发生在 AppServiceProvider 的 boot **之前**，因此：
+
+| 事件 | 时机 | 相对于 AppServiceProvider |
+|------|------|--------------------------|
+| nwidart 主 SP register | register 阶段早期 | 更早 |
+| nwidart 主 SP boot | boot 阶段早期 | 更早 |
+| 模块 SP register | nwidart 主 SP boot 内 | 更早 |
+| 模块 SP boot | nwidart 主 SP boot 内 | 更早 |
+| AppServiceProvider register | register 阶段晚期 | - |
+| AppServiceProvider boot | boot 阶段中期 | - |
+| 其他应用 SP boot | boot 阶段晚期 | 更晚 |
+| app.booted 回调 | boot 阶段全部完成后 | 最晚 |
+
+### 3.5 完整时序图（后端启动阶段）
 
 ```
-时间轴 ──────────────────────────────────────────────────────────▶
+时间轴 ───────────────────────────────────────────────────────────────────────▶
 
-register 阶段
-  ├─ nwidart 主 SP register()
-  │     └─ 注册模块仓库、命令、Facade 等
+register 阶段（按注册顺序）
+  │
+  ├─ 框架核心 SP register()
+  │
+  ├─ nwidart 主 SP register()  ← 包自动发现，先于应用 SP
+  │     └─ 注册模块仓库、命令、Facade 等基础设施
+  │
   ├─ lavary/laravel-menu SP register()
+  │     └─ 注册 Menu 单例到容器
+  │
   ├─ AppServiceProvider register()
-  ├─ RouteServiceProvider register()
+  │     └─ 配置 Bouncer 作用域等
+  │
   └─ ... 其他应用 SP register()
 
-boot 阶段
+────────────────────────────────────────────────────────────────────────
+boot 阶段（按注册顺序）
+  │
   ├─ nwidart 主 SP boot()
-  │     ├─ 扫描所有模块
+  │     │
+  │     ├─ 扫描 Modules/ 目录
+  │     ├─ 读取模块启用状态
+  │     │
   │     └─ 对每个启用模块：
-  │           ├─ 模块 SP register()    ← 模块 SP 的 register
-  │           └─ 模块 SP boot()        ← 模块 SP 的 boot
+  │           │
+  │           ├─ 模块 SP register()   ← 通过 $app->register() 加入
+  │           │     └─ 绑定服务、合并配置
+  │           │
+  │           └─ 模块 SP boot()       ← 立即执行（因为已在 boot 阶段）
   │                 ├─ 注册路由
   │                 ├─ 注册视图
   │                 ├─ Module::script() ← 注册前端脚本
   │                 ├─ Module::style()  ← 注册前端样式
-  │                 └─ ... 其他模块启动逻辑
+  │                 └─ （可以合并菜单配置）
   │
   ├─ AppServiceProvider boot()
-  │     ├─ 检查数据库是否就绪
-  │     └─ addMenus()                  ← 构建 main_menu/setting_menu
-  │           ├─ \Menu::make('main_menu', ...)
-  │           └─ \Menu::make('setting_menu', ...)
+  │     ├─ 检查数据库是否就绪（InstallUtils::isDbCreated()）
+  │     ├─ addMenus()                 ← 从配置创建菜单
+  │     │     ├─ \Menu::make('main_menu', ...)
+  │     │     ├─ \Menu::make('setting_menu', ...)
+  │     │     └─ \Menu::make('customer_portal_menu', ...)
+  │     ├─ Gate::policy() 注册策略
+  │     └─ ... 其他启动逻辑
   │
   ├─ RouteServiceProvider boot()
   │     └─ 加载路由文件
   │
   └─ ... 其他 SP boot()
 
+────────────────────────────────────────────────────────────────────────
 应用 booted 阶段
+  │
   └─ 触发 app.booted 回调
+        └─ （模块可以在这里追加菜单）
+
+────────────────────────────────────────────────────────────────────────
+路由匹配与执行阶段
+  │
+  ├─ 路由匹配
+  ├─ 中间件执行
+  ├─ 控制器执行
+  │     └─ BootstrapController → generateMenu() → 输出菜单 JSON
+  │
+  └─ 返回响应
 ```
 
-> **关键结论**：模块服务提供者的 `boot()` **先于** AppServiceProvider 的 `boot()` 执行。
->
-> 这意味着：
-> - ✅ 模块可以在 boot 阶段注册前端资源（Module::script/style）
-> - ❌ 模块不能直接通过 `Menu::get('main_menu')` 获取菜单（因为菜单还没创建）
-> - ✅ 模块可以通过**配置合并**方式扩展菜单（在 AppServiceProvider 读取配置前合并）
+### 3.6 关键结论
+
+1. **模块 SP 的 boot 先于 AppServiceProvider 的 boot**
+   - 原因：nwidart 主 SP 先注册，其 boot 也先执行；模块 SP 在 nwidart boot 内部被注册和启动
+
+2. **模块 SP 通过 $app->register() 被加入 Laravel 容器**
+   - 发生在 nwidart 主 SP 的 boot 阶段
+   - 由于应用已处于 boot 阶段，模块 SP 的 boot 会被**立即调用**
+
+3. **菜单创建发生在 AppServiceProvider boot 阶段**
+   - 依赖 `config('invoiceshelf.main_menu')` 配置
+   - 有前提条件：数据库必须已创建
+
+4. **模块扩展菜单的两个时间窗口**
+   - ✅ **窗口 A**：模块 SP boot 阶段 → 合并配置（在 AppServiceProvider 读配置前）
+   - ✅ **窗口 B**：app.booted 回调 → 直接操作 Menu 对象（在菜单创建后）
+   - ❌ **中间地带**：模块 SP boot 结束后到 AppServiceProvider boot 前 → 什么都做不了
 
 ---
 
@@ -1168,14 +1358,34 @@ public function boot(): void
     → 动态追加菜单（方案 B）
   路由匹配 → 控制器 → 响应
 
+API 路径速记：
+  /api/v1/bootstrap             ← 管理端初始化（无 admin 前缀）
+  /api/v1/{company}/customer/bootstrap  ← 客户端初始化
+  /modules/scripts/{name}       ← 模块脚本
+  /modules/styles/{name}        ← 模块样式
+
 前端（按时间顺序）：
   HTML 解析 → 样式加载
   Vite 主脚本 → 创建 InvoiceShelf 实例
   模块脚本 → InvoiceShelf.booting() 注册回调
   start() → executeCallbacks() → 模块路由/组件生效
   Vue 挂载 → LayoutBasic 渲染
-  Bootstrap API → 菜单数据 → 侧边栏渲染
+  globalStore.bootstrap() → GET /api/v1/bootstrap
+  菜单数据存入 mainMenu
+  menuGroups getter 按 group 分组
+  TheSiteSidebar 渲染 router-link
 ```
+
+### 菜单数据 6 层转换速记
+
+| 层级 | 数据形态 | 操作 |
+|------|----------|------|
+| 1 | PHP 配置数组 | `config('invoiceshelf.main_menu')` |
+| 2 | Menu 对象 | `\Menu::make('main_menu', ...)` |
+| 3 | JSON 数组 | BootstrapController 权限过滤后输出 |
+| 4 | Pinia State | `globalStore.mainMenu` |
+| 5 | 分组 getter | `globalStore.menuGroups` |
+| 6 | Vue 组件 | `<router-link>` 渲染 |
 
 ### 为什么这样设计？
 
@@ -1183,5 +1393,6 @@ public function boot(): void
 2. **前端层面**：`booting` 钩子模式解决了模块脚本先加载、主应用后初始化的时序问题
 3. **菜单系统**：配置驱动的菜单创建 + 多种扩展方式，兼顾简单性和灵活性
 4. **资源加载**：通过控制器动态输出模块资源，支持缓存协商和权限控制
+5. **API 设计**：管理端 API 路径不带 `admin` 前缀，命名空间的 `Admin` 仅用于代码组织，URL 更简洁
 
-这套设计既保持了 Laravel 生态的惯用模式，又通过前端启动钩子实现了 Vue 应用的动态扩展，是一套相对完整且解耦的模块化方案。
+这套设计既保持了 Laravel 生态的惯用模式（服务提供者、门面、事件），又通过前端启动钩子实现了 Vue 应用的动态扩展，是一套相对完整且解耦的模块化方案。
