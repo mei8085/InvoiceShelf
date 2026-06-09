@@ -1,15 +1,17 @@
 # 版本升级事件与监听器深度分析
 
-## 一、核心结论（事务边界核对版）
+## 一、核心结论（迁移事务机制深度核对版）
 
-经过逐行代码核对 + 事务边界分析，以下是确认后的结论：
+经过沿迁移执行链路逐行核对 + Laravel 框架机制分析，以下是确认后的结论：
 
 1. **Listener 基类只是一个普通 PHP 类**，不是 Laravel 标准事件监听器
-2. **migrateUpdate 本身不包事务**，只是裸调 `Artisan::call('migrate --force')`
-3. **单个 migration 的事务保证取决于数据库驱动**，不能笼统说 MySQL 有事务
-4. **整个升级流程没有全局事务**，文件系统操作 + 数据库操作完全脱节
-5. **版本号双写有真实风险**，迁移失败 + 手动调用 finishUpdate 会导致版本号造假
-6. **UpdateFinished 事件会触发，但没有任何监听器在监听**（事件是空转）
+2. **migrateUpdate 本身不包事务**，只是裸调 `Artisan::call('migrate --force')`，连返回值都不检查
+3. **单个 migration 是否包事务由两个因素共同决定**：迁移类的 `$withinTransaction` 属性 + Schema Grammar 的 `supportsSchemaTransactions()`，两者需同时满足
+4. **MySQL 和 PostgreSQL 绝对不能统一视为有事务保证**：PostgreSQL 的 Schema Grammar 支持事务 DDL，MySQL 的不支持，所以 MySQL 下 Laravel 根本不会给迁移包事务
+5. **即使是纯 DML 迁移，在 MySQL 下也不会被包事务**，因为 `supportsSchemaTransactions()` 是整体判断，不区分迁移内容
+6. **整个升级流程没有全局事务**，文件系统操作 + 数据库操作完全脱节，复制文件后迁移失败是最危险的阶段
+7. **版本号双写有多重真实风险**：半成功状态下 finishUpdate 可强行造假、部分版本可能无迁移内写入、两处版本号可能不一致、MySQL 下单迁移中途失败可能版本号已更新
+8. **UpdateFinished 事件会触发，但没有任何监听器在监听**（事件是空转）
 
 ---
 
@@ -236,17 +238,17 @@ protected function runMigration($migration, $method)
 
 #### 各驱动的 Schema Grammar 事务支持
 
-| 驱动 | Schema Grammar 类 | supportsSchemaTransactions() | 说明 |
-|------|-------------------|----------------------------|------|
-| MySQL | `MySqlGrammar` | ❌ **false** | DDL 会隐式提交事务 |
+| 驱动 | Schema Grammar 类 | supportsSchemaTransactions() | 底层原因 |
+|------|-------------------|----------------------------|----------|
+| MySQL | `MySqlGrammar` | ❌ **false** | MySQL DDL 会隐式提交事务，无法实现事务性 DDL |
 | MariaDB | `MariaDbGrammar` | ❌ **false** | 同 MySQL |
-| PostgreSQL | `PostgresGrammar` | ✅ **true** | 完整支持事务 DDL |
-| SQLite | `SQLiteGrammar` | ✅ **true** | 基本支持事务 DDL |
-| SQL Server | `SqlServerGrammar` | ⚠️ 部分支持 | 仅部分 DDL 可事务化 |
+| PostgreSQL | `PostgresGrammar` | ✅ **true** | PostgreSQL 原生支持事务 DDL |
+| SQLite | `SQLiteGrammar` | ✅ **true** | SQLite 基本支持事务 DDL |
+| SQL Server | `SqlServerGrammar` | ⚠️ 部分支持 | 仅部分 DDL 语句可事务化 |
 
-**关键校正：MySQL 的 Schema Grammar 明确返回 `false`，所以 MySQL 下 Laravel 根本不会尝试把迁移包在事务里！**
+**关键结论：MySQL 的 Schema Grammar 明确返回 `false`，所以 MySQL 下 Laravel 根本不会尝试把迁移包在事务里！**
 
-不是"事务会被 DDL 打断"的问题，而是**Laravel 知道 MySQL 不支持事务 DDL，所以一开始就不会开事务**。
+不是"事务会被 DDL 打断"的问题，而是**Laravel 通过 Schema Grammar 预先知道 MySQL 不支持事务 DDL，所以一开始就不会开事务**。底层原因是 MySQL 的 DDL 语句会隐式提交当前事务，但 Laravel 层面的判断依据是 `supportsSchemaTransactions()` 方法。
 
 ### 4.5 MySQL vs PostgreSQL：不能统一视为有事务保证
 
@@ -447,17 +449,24 @@ finishUpdate 只改两件事：
 ─────────────────────────────────────────
 
   5. 执行所有未执行的迁移（按时间戳顺序）
-     
-     迁移 1 → 执行 → 提交（或隐式提交）
-     迁移 2 → 执行 → 提交（或隐式提交）
+
+     对每个迁移，Migrator 的判断逻辑：
+       if (迁移.$withinTransaction && SchemaGrammar.supportsSchemaTransactions()) {
+           在事务内执行 up()
+       } else {
+           直接执行 up()（不包事务）
+       }
+
+     迁移 1 → 执行 → 结束
+     迁移 2 → 执行 → 结束
      ...
      迁移 N → 执行 → 成功/失败
-     
-     每个迁移内部：
-       - 如果只有 DML 且数据库支持事务 → 有事务保证
-       - 如果包含 DDL 且是 MySQL → 无完整事务保证
-       - DDL 执行时会隐式提交
-     
+
+     每个迁移是否有事务包装：
+       - PostgreSQL / SQLite：有（withinTransaction=true + grammar 支持）
+       - MySQL / MariaDB：无（withinTransaction=true 但 grammar 不支持）
+       - 注意：与迁移内是 DDL 还是 DML 无关，只看驱动
+
      最后一个成功的迁移决定了当前版本号
 
 ─────────────────────────────────────────
@@ -477,6 +486,7 @@ finishUpdate 只改两件事：
   代码版本 = 新版本（已经覆盖了）
   数据库版本 = 最后一个成功迁移对应的版本
   数据库结构 = 部分新 + 部分旧
+  MySQL 下失败的迁移内部也可能部分生效
   状态：不一致，可能无法正常运行
 ```
 
@@ -498,15 +508,20 @@ finishUpdate 只改两件事：
 5. copyFiles()              复制文件覆盖代码
    → 此时 version.md 已变成新版本
    → 新的迁移文件已就位
+   ↑ 此步不可逆，覆盖后无法回滚
 6. deleteFiles()            删除旧文件
+   ↑ 此步不可逆
 7. migrateUpdate()          执行 php artisan migrate --force
-   → 所有新迁移依次执行
+   → 所有新迁移按时间戳顺序依次执行
+   → 每个迁移是否包事务：取决于 $withinTransaction + SchemaGrammar
+   → PostgreSQL/SQLite：单迁移有事务
+   → MySQL/MariaDB：单迁移无事务
    → 表结构变更
    → 数据迁移
-   → settings.version 更新
+   → settings.version 更新（如果迁移里写了）
 8. finishUpdate()           收尾
    → settings.version 再写一次
-   → 触发 UpdateFinished 事件
+   → 触发 UpdateFinished 事件（无人监听）
 ```
 
 ### 6.2 Web API 方式
@@ -528,7 +543,7 @@ finishUpdate 只改两件事：
 
 ## 七、为什么让人"没把握"
 
-结合代码，总结几个不确定的根源：
+结合代码和迁移事务机制分析，总结几个不确定的根源：
 
 ### 1. 事件体系似有实无
 
@@ -551,13 +566,35 @@ finishUpdate 只改两件事：
 - 有的版本号写在末尾，有的写在中间
 - 没有统一规范，不好预测
 
-### 4. 没有事务包裹整个升级流程
+### 4. 事务边界不直观
 
-- 单个迁移有事务
-- 但整个升级过程没有全局事务
-- 升级到一半失败了怎么办？没有回滚机制
+- 代码里看不到事务怎么包的，得靠对 Laravel 框架的了解来推断
+- `$withinTransaction = true` 看起来像是默认开启事务
+- 但 MySQL 下这个属性等于摆设，因为 Schema Grammar 不支持
+- 单个迁移到底有没有事务？不看驱动不知道
 
-### 5. 事件触发无声无息
+### 5. withinTransaction 容易误导
+
+- 迁移基类有 `$withinTransaction = true`
+- 名字叫"在事务内"，给人一种"默认包事务"的错觉
+- 但实际上这只是个开关，最终能不能用还要看 Schema Grammar
+- 不了解 Laravel 内部机制的人很容易被误导
+
+### 6. 文件系统操作无回滚
+
+- 复制文件覆盖代码后，没法回滚
+- 删除旧文件后，没法回滚
+- 如果迁移失败，代码已经是新的，数据库还是旧的
+- 处于"不上不下"的尴尬状态
+
+### 7. 版本号可能造假
+
+- 如果迁移失败了，手动调用 finishUpdate 可以强行更新版本号
+- 版本号显示是最新的，但数据库结构其实不完整
+- 表面上升级成功了，实际上可能有各种隐藏问题
+- MySQL 下甚至单个迁移内部都可能出现"版本号更了但后续操作失败"的情况
+
+### 8. 事件触发无声无息
 
 - 事件触发了，但你不知道有没有监听者
 - 想找监听者，发现没有 EventServiceProvider
