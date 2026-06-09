@@ -2,6 +2,8 @@
 
 本文档梳理 InvoiceShelf 项目中前端状态管理（Pinia Store）、后端 API 资源类（Laravel Eloquent API Resource）以及字段序列化之间的协作关系。
 
+> **路径约定**：本文档中所有文件路径均为**仓库相对路径**，以项目根目录 `125-InvoiceShelf/` 为基准。
+
 ---
 
 ## 一、整体架构概览
@@ -45,7 +47,9 @@ Laravel 的 Eloquent API Resource 充当**数据转换层**，负责：
 
 ### 2.2 资源类结构示例
 
-以 [InvoiceResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/InvoiceResource.php) 为例：
+以 `app/Http/Resources/InvoiceResource.php` 为例，该类继承 `JsonResource`，通过 `toArray()` 方法定义序列化输出结构。
+
+**代码证据**：`app/Http/Resources/InvoiceResource.php` 第 8-82 行
 
 ```php
 class InvoiceResource extends JsonResource
@@ -60,7 +64,7 @@ class InvoiceResource extends JsonResource
             'status' => $this->status,
             'sub_total' => $this->sub_total,
             'total' => $this->total,
-            // ...
+            // ... 更多字段
 
             // 2. 访问器字段（Model 中 getXxxAttribute 方法）
             'formatted_created_at' => $this->formattedCreatedAt,
@@ -68,7 +72,6 @@ class InvoiceResource extends JsonResource
             'formatted_invoice_date' => $this->formattedInvoiceDate,
             'allow_edit' => $this->allow_edit,
             'payment_module_enabled' => $this->payment_module_enabled,
-            // ...
 
             // 3. 条件加载的嵌套关系（when + 子 Resource）
             'items' => $this->when($this->items()->exists(), function () {
@@ -83,7 +86,6 @@ class InvoiceResource extends JsonResource
             'currency' => $this->when($this->currency()->exists(), function () {
                 return new CurrencyResource($this->currency);
             }),
-            // ...
         ];
     }
 }
@@ -94,43 +96,134 @@ class InvoiceResource extends JsonResource
 **字段不是"拉平"的，而是分层嵌套的。** 资源类中的字段按来源分为三类：
 
 #### 类型 A：数据库直接字段
+
 直接对应数据库表中的列，通过 `$this->字段名` 访问。
-- 例：`id`, `invoice_number`, `invoice_date`, `customer_id`, `sub_total`, `total`
 
-#### 类型 B：Eloquent 访问器（Accessors）
-在 Model 中通过 `getXxxAttribute()` 方法定义的计算属性，在资源类中以驼峰/蛇形命名访问。
-- 例：`formattedCreatedAt`, `invoicePdfUrl`, `allow_edit`, `payment_module_enabled`
-
-以 [Invoice.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Models/Invoice.php) 中的访问器为例：
+**代码证据**：`app/Http/Resources/InvoiceResource.php` 第 18-59 行
 
 ```php
-// Model 中定义
+'id' => $this->id,
+'invoice_date' => $this->invoice_date,
+'due_date' => $this->due_date,
+'invoice_number' => $this->invoice_number,
+'status' => $this->status,
+'paid_status' => $this->paid_status,
+'tax_per_item' => $this->tax_per_item,
+'sub_total' => $this->sub_total,
+'total' => $this->total,
+'customer_id' => $this->customer_id,
+// ...
+```
+
+- 对应模型：`app/Models/Invoice.php` 第 52-74 行（`$guarded` 和 `$casts` 属性定义了字段和类型转换）
+
+#### 类型 B：Eloquent 访问器（Accessors）
+
+在 Model 中通过 `getXxxAttribute()` 方法定义的计算属性，在资源类中以驼峰/蛇形命名访问。这些属性会被追加到模型数组/JSON 输出中。
+
+**代码证据**：`app/Models/Invoice.php` 第 56-62 行（注册访问器到 `$appends`）
+
+```php
 protected $appends = [
     'formattedCreatedAt',
     'formattedInvoiceDate',
+    'formattedDueDate',
+    'formattedDueAmount',
     'invoicePdfUrl',
 ];
+```
 
+**代码证据**：`app/Models/Invoice.php` 第 126-129 行（`getInvoicePdfUrlAttribute` 访问器）
+
+```php
 public function getInvoicePdfUrlAttribute()
 {
     return url('/invoices/pdf/'.$this->unique_hash);
 }
+```
 
+**代码证据**：`app/Models/Invoice.php` 第 140-162 行（`getAllowEditAttribute` 访问器，包含复杂业务逻辑）
+
+```php
 public function getAllowEditAttribute()
 {
-    // 复杂业务逻辑...
+    $retrospective_edit = CompanySetting::getSetting('retrospective_edits', $this->company_id);
+    $allowed = true;
+    $status = [self::STATUS_DRAFT, self::STATUS_SENT, ...];
+    // ... 多条件判断
     return $allowed;
 }
+```
 
-// Resource 中直接使用
+在 Resource 中直接使用这些访问器字段：
+
+**代码证据**：`app/Http/Resources/InvoiceResource.php` 第 51-56 行
+
+```php
+'formatted_created_at' => $this->formattedCreatedAt,
 'invoice_pdf_url' => $this->invoicePdfUrl,
+'formatted_invoice_date' => $this->formattedInvoiceDate,
+'formatted_due_date' => $this->formattedDueDate,
 'allow_edit' => $this->allow_edit,
+'payment_module_enabled' => $this->payment_module_enabled,
 ```
 
 #### 类型 C：嵌套关系资源
+
 通过 `$this->when()` 条件加载，返回子 Resource 或 Resource 集合。
 - 一对一关系用 `new XxxResource($this->relation)`
 - 一对多关系用 `XxxResource::collection($this->relation)`
+
+**代码证据**：`app/Http/Resources/InvoiceResource.php` 第 60-80 行
+
+```php
+'items' => $this->when($this->items()->exists(), function () {
+    return InvoiceItemResource::collection($this->items);
+}),
+'customer' => $this->when($this->customer()->exists(), function () {
+    return new CustomerResource($this->customer);
+}),
+'creator' => $this->when($this->creator()->exists(), function () {
+    return new UserResource($this->creator);
+}),
+'taxes' => $this->when($this->taxes()->exists(), function () {
+    return TaxResource::collection($this->taxes);
+}),
+'currency' => $this->when($this->currency()->exists(), function () {
+    return new CurrencyResource($this->currency);
+}),
+```
+
+对应的模型关系定义：
+
+**代码证据**：`app/Models/Invoice.php` 第 86-124 行
+
+```php
+public function items(): HasMany
+{
+    return $this->hasMany(InvoiceItem::class);
+}
+
+public function customer(): BelongsTo
+{
+    return $this->belongsTo(Customer::class, 'customer_id');
+}
+
+public function taxes(): HasMany
+{
+    return $this->hasMany(Tax::class);
+}
+
+public function currency(): BelongsTo
+{
+    return $this->belongsTo(Currency::class);
+}
+
+public function creator(): BelongsTo
+{
+    return $this->belongsTo(User::class, 'creator_id');
+}
+```
 
 ### 2.4 嵌套资源的递归结构
 
@@ -160,11 +253,34 @@ InvoiceResource
 └── taxes (TaxResource[])
 ```
 
+**代码证据**：
+
+- Invoice → items → taxes：`app/Http/Resources/InvoiceItemResource.php` 第 38-40 行
+  ```php
+  'taxes' => $this->when($this->taxes()->exists(), function () {
+      return TaxResource::collection($this->taxes);
+  }),
+  ```
+
+- Customer → billing：`app/Http/Resources/CustomerResource.php` 第 40-42 行
+  ```php
+  'billing' => $this->when($this->billingAddress()->exists(), function () {
+      return new AddressResource($this->billingAddress);
+  }),
+  ```
+
+- Address → country：`app/Http/Resources/AddressResource.php` 第 32-34 行
+  ```php
+  'country' => $this->when($this->country()->exists(), function () {
+      return new CountryResource($this->country);
+  }),
+  ```
+
 相关资源文件：
-- [CustomerResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/CustomerResource.php)
-- [InvoiceItemResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/InvoiceItemResource.php)
-- [TaxResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/TaxResource.php)
-- [AddressResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/AddressResource.php)
+- `app/Http/Resources/CustomerResource.php`
+- `app/Http/Resources/InvoiceItemResource.php`
+- `app/Http/Resources/TaxResource.php`
+- `app/Http/Resources/AddressResource.php`
 
 ### 2.5 资源类与集合类
 
@@ -172,18 +288,30 @@ InvoiceResource
 - **资源集合**：`InvoiceResource::collection($invoices)` — 返回对象数组，包装在 `data` 键下，附带 `meta` 和 `links` 分页信息
 - **自定义集合类**：`InvoiceCollection` — 通常用于添加额外的 meta 数据
 
-参考：[InvoiceCollection.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/InvoiceCollection.php)
+**代码证据**：`app/Http/Resources/InvoiceCollection.php` 第 8-18 行
+
+```php
+class InvoiceCollection extends ResourceCollection
+{
+    public function toArray($request): array
+    {
+        return parent::toArray($request);
+    }
+}
+```
 
 ### 2.6 控制器中的使用
 
-控制器从数据库查询 Model（通常带着 `with()` 预加载关联），然后用 Resource 转换后返回：
+控制器从数据库查询 Model（通常带着 `with()` 预加载关联），然后用 Resource 转换后返回。
 
-[InvoicesController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php)
+**代码证据**：`app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php` 第 21-37 行（列表接口）
 
 ```php
-// 列表接口
 public function index(Request $request)
 {
+    $this->authorize('viewAny', Invoice::class);
+    $limit = $request->input('limit', 10);
+
     $invoices = Invoice::whereCompany()
         ->applyFilters($request->all())
         ->with('customer')       // 预加载关联，避免 N+1
@@ -195,10 +323,14 @@ public function index(Request $request)
             'invoice_total_count' => Invoice::whereCompany()->count(),
         ]]);
 }
+```
 
-// 详情接口
+**代码证据**：`app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php` 第 65-70 行（详情接口）
+
+```php
 public function show(Request $request, Invoice $invoice)
 {
+    $this->authorize('view', $invoice);
     return new InvoiceResource($invoice);
 }
 ```
@@ -209,12 +341,13 @@ public function show(Request $request, Invoice $invoice)
 
 ### 3.1 HTTP 请求层
 
-前端使用 Axios 封装的 HTTP 客户端发送请求：
+前端使用 Axios 封装的 HTTP 客户端发送请求，通过请求拦截器自动注入认证 token 和 company header。
 
-[http/index.js](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/http/index.js)
+**代码证据**：`resources/scripts/http/index.js` 第 1-39 行
 
 ```js
 import axios from 'axios'
+import Ls from '@/scripts/services/ls.js'
 
 const instance = axios.create({
   withCredentials: true,
@@ -237,18 +370,23 @@ instance.interceptors.request.use(function (config) {
 
 ### 3.2 Store 的基本结构
 
-以 [invoice.js](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stores/invoice.js) 为例，每个 Store 包含三部分：
+以 `resources/scripts/admin/stores/invoice.js` 为例，每个 Store 包含 state、getters、actions 三部分。
+
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 20-99 行
 
 ```js
 import { defineStore } from 'pinia'
 import http from '@/scripts/http'
 import invoiceStub from '../stub/invoice'
 
-export const useInvoiceStore = () => {
-  return defineStore('invoice', {
+export const useInvoiceStore = (useWindow = false) => {
+  const defineStoreFunc = useWindow ? window.pinia.defineStore : defineStore
+
+  return defineStoreFunc('invoice', {
     // state: 状态数据
     state: () => ({
       invoices: [],          // 列表数据
+      selectedInvoices: [],
       invoiceTotalCount: 0,  // 总数
       newInvoice: {          // 当前编辑/新建的表单数据
         ...invoiceStub(),
@@ -257,9 +395,13 @@ export const useInvoiceStore = () => {
 
     // getters: 计算属性
     getters: {
-      getInvoice: (state) => (id) => 
-        state.invoices.find(invoice => invoice.id === id),
+      getInvoice: (state) => (id) => {
+        let invId = parseInt(id)
+        return state.invoices.find((invoice) => invoice.id === invId)
+      },
       getSubTotal() { /* ... */ },
+      getTotal() { /* ... */ },
+      isEdit: (state) => (state.newInvoice.id ? true : false),
     },
 
     // actions: 方法（含 API 调用）
@@ -267,6 +409,8 @@ export const useInvoiceStore = () => {
       fetchInvoices(params) { /* ... */ },
       fetchInvoice(id) { /* ... */ },
       addInvoice(data) { /* ... */ },
+      updateInvoice(data) { /* ... */ },
+      // ... 更多 actions
     },
   })()
 }
@@ -276,8 +420,9 @@ export const useInvoiceStore = () => {
 
 #### 列表数据获取
 
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 122-136 行
+
 ```js
-// Store action
 fetchInvoices(params) {
   return new Promise((resolve, reject) => {
     http
@@ -297,21 +442,25 @@ fetchInvoices(params) {
 }
 ```
 
-后端响应的 JSON 结构：
+后端响应的 JSON 结构（对应 `InvoiceResource::collection()` + `additional()`）：
 ```json
 {
   "data": [
-    { "id": 1, "invoice_number": "INV-001", "status": "SENT", ... },
-    { "id": 2, "invoice_number": "INV-002", "status": "DRAFT", ... }
+    { "id": 1, "invoice_number": "INV-001", "status": "SENT", "customer": { "id": 5, "name": "..." } },
+    { "id": 2, "invoice_number": "INV-002", "status": "DRAFT", "customer": { "id": 3, "name": "..." } }
   ],
   "meta": {
     "invoice_total_count": 100
   },
-  "links": { ... }
+  "links": {
+    "first": "...", "last": "...", "prev": null, "next": "..."
+  }
 }
 ```
 
 #### 详情数据获取
+
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 138-152 行（`fetchInvoice`）
 
 ```js
 fetchInvoice(id) {
@@ -324,26 +473,43 @@ fetchInvoice(id) {
         this.setCustomerAddresses(this.newInvoice.customer)
         resolve(response)
       })
-      .catch(...)
+      .catch((err) => {
+        handleError(err)
+        reject(err)
+      })
   })
 }
+```
 
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 154-173 行（`setInvoiceData`）
+
+```js
 setInvoiceData(invoice) {
   // 关键：用 Object.assign 把后端数据合并到现有 newInvoice 对象
   Object.assign(this.newInvoice, invoice)
 
-  // 额外的前端逻辑：补充空 tax 项、转换折扣单位等
+  // 额外的前端逻辑：补充空 tax 项
   if (this.newInvoice.tax_per_item === 'YES') {
     this.newInvoice.items.forEach((_i) => {
       if (_i.taxes && !_i.taxes.length)
         _i.taxes.push({ ...taxStub, id: Guid.raw() })
     })
   }
-  // ...
+
+  // 折扣单位转换等前端特有逻辑
+  if (this.newInvoice.discount_per_item === 'YES') {
+    this.newInvoice.items.forEach((_i, index) => {
+      if (_i.discount_type === 'fixed')
+        this.newInvoice.items[index].discount = _i.discount / 100
+    })
+  } else {
+    if (this.newInvoice.discount_type === 'fixed')
+      this.newInvoice.discount = this.newInvoice.discount / 100
+  }
 }
 ```
 
-**关键点：** `Object.assign(this.newInvoice, invoice)` 将后端返回的完整 JSON 对象（含嵌套的 customer、items、taxes 等）直接合并到前端状态对象中。**嵌套结构被完整保留，并没有被拉平。**
+**关键点**：`Object.assign(this.newInvoice, invoice)` 将后端返回的完整 JSON 对象（含嵌套的 customer、items、taxes 等）直接合并到前端状态对象中。**嵌套结构被完整保留，并没有被拉平。**
 
 ---
 
@@ -358,7 +524,7 @@ Stub 是前端定义的**默认数据结构模板**，用于：
 
 ### 4.2 Stub 示例
 
-[invoice.js stub](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stub/invoice.js)
+**代码证据**：`resources/scripts/admin/stub/invoice.js` 第 1-39 行
 
 ```js
 import Guid from 'guid'
@@ -375,7 +541,9 @@ export default function () {
     due_date: '',
     sub_total: 0,
     total: 0,
-    // ...
+    tax_per_item: null,
+    tax_included: false,
+    discount_per_item: null,
 
     // 嵌套结构（与后端 Resource 对应）
     customer: null,
@@ -397,13 +565,54 @@ export default function () {
 }
 ```
 
+对应的子 stub：
+
+**代码证据**：`resources/scripts/admin/stub/invoice-item.js` 第 1-18 行
+
+```js
+export default {
+  invoice_id: null,
+  item_id: null,
+  name: '',
+  title: '',
+  description: null,
+  quantity: 1,
+  price: 0,
+  discount_type: 'fixed',
+  discount_val: 0,
+  discount: 0,
+  total: 0,
+  totalTax: 0,
+  totalSimpleTax: 0,
+  totalCompoundTax: 0,
+  tax: 0,
+  taxes: [],
+}
+```
+
+**代码证据**：`resources/scripts/admin/stub/address.js` 第 1-11 行
+
+```js
+export default {
+  name: null,
+  phone: null,
+  address_street_1: null,
+  address_street_2: null,
+  city: null,
+  state: null,
+  country_id: null,
+  zip: null,
+  type: null,
+}
+```
+
 ### 4.3 Stub 与 Resource 的字段对比
 
-| 来源 | 字段举例 | 说明 |
-|------|---------|------|
-| 两者共有 | `id`, `invoice_number`, `customer_id`, `sub_total`, `items`, `taxes` | 数据库字段，前后端对齐 |
-| 仅后端 Resource | `formatted_created_at`, `invoice_pdf_url`, `allow_edit`, `payment_module_enabled`, `formatted_invoice_date` | 计算属性、格式化字段、权限字段 |
-| 仅前端 Stub | `selectedNote`, `selectedCurrency`, `customFields` | 前端 UI 状态、临时字段 |
+| 来源 | 字段举例 | 说明 | 代码位置 |
+|------|---------|------|---------|
+| 两者共有 | `id`, `invoice_number`, `customer_id`, `sub_total`, `items`, `taxes` | 数据库字段，前后端对齐 | `app/Http/Resources/InvoiceResource.php` 第 18-50 行 / `resources/scripts/admin/stub/invoice.js` 第 6-27 行 |
+| 仅后端 Resource | `formatted_created_at`, `invoice_pdf_url`, `allow_edit`, `payment_module_enabled`, `formatted_invoice_date` | 计算属性、格式化字段、权限字段 | `app/Http/Resources/InvoiceResource.php` 第 51-59 行 |
+| 仅前端 Stub | `selectedNote`, `selectedCurrency`, `customFields`, `title` (item) | 前端 UI 状态、临时字段 | `resources/scripts/admin/stub/invoice.js` 第 35-38 行 |
 
 ### 4.4 数据合并机制
 
@@ -417,7 +626,31 @@ export default function () {
   3. setInvoiceData() 做额外前端处理       ← 补充/转换字段
 ```
 
-**重要：** `Object.assign` 是**浅合并**。如果 API 返回了 `customer` 对象，会完整替换 stub 中的 `customer: null`；如果 API 没有返回某个字段，stub 的默认值会保留。
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 36-39 行（state 初始化用 stub）
+
+```js
+newInvoice: {
+  ...invoiceStub(),
+},
+```
+
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 102-106 行（重置时用 stub）
+
+```js
+resetCurrentInvoice() {
+  this.newInvoice = {
+    ...invoiceStub(),
+  }
+},
+```
+
+**代码证据**：`resources/scripts/admin/stores/invoice.js` 第 155 行（编辑时 Object.assign 合并）
+
+```js
+Object.assign(this.newInvoice, invoice)
+```
+
+**重要**：`Object.assign` 是**浅合并**。如果 API 返回了 `customer` 对象，会完整替换 stub 中的 `customer: null`；如果 API 没有返回某个字段，stub 的默认值会保留。
 
 ---
 
@@ -430,23 +663,48 @@ export default function () {
 **举例：Invoice 的 customer 字段**
 
 后端 InvoiceResource 定义：
+
+**代码证据**：`app/Http/Resources/InvoiceResource.php` 第 63-65 行
+
 ```php
 'customer' => $this->when($this->customer()->exists(), function () {
     return new CustomerResource($this->customer);
 }),
 ```
 
-前端接收到的数据：
+CustomerResource 内部又有自己的嵌套字段：
+
+**代码证据**：`app/Http/Resources/CustomerResource.php` 第 40-54 行
+
+```php
+'billing' => $this->when($this->billingAddress()->exists(), function () {
+    return new AddressResource($this->billingAddress);
+}),
+'shipping' => $this->when($this->shippingAddress()->exists(), function () {
+    return new AddressResource($this->shippingAddress);
+}),
+'currency' => $this->when($this->currency()->exists(), function () {
+    return new CurrencyResource($this->currency);
+}),
+```
+
+前端接收到的数据（嵌套结构）：
 ```js
 {
   id: 1,
   invoice_number: 'INV-001',
-  customer: {           // 嵌套对象，不是 customer_id, customer_name 这种扁平字段
+  customer_id: 5,           // 外键字段（扁平）
+  customer: {               // 嵌套对象（不是扁平的）
     id: 5,
     name: 'Acme Corp',
     email: 'acme@example.com',
-    billing: { ... },   // 进一步嵌套
+    billing: {              // 进一步嵌套
+      id: 10,
+      address_street_1: '123 Main St',
+      city: 'New York',
+    },
     shipping: { ... },
+    currency: { ... },
   }
 }
 ```
@@ -458,22 +716,43 @@ export default function () {
    - `customer` 是嵌套的关联资源对象（条件加载）
    - 两者在 Resource 中并列存在，各有用途
 
+   **代码证据**：`app/Http/Resources/InvoiceResource.php` 第 40 行 + 第 63-65 行
+   ```php
+   'customer_id' => $this->customer_id,   // 外键（第 40 行）
+   // ...
+   'customer' => $this->when(...)          // 嵌套对象（第 63-65 行）
+   ```
+
 2. **列表接口与详情接口的差异**
    - 列表接口通常只加载少量关联（如 `with('customer')`），嵌套较浅
    - 详情接口会加载更多关联（items, taxes, fields 等），嵌套较深
    - 具体加载哪些关联，由控制器的 `with()` 和 Resource 的 `when()` 共同决定
 
+   **代码证据**：`app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php` 第 27-31 行
+   ```php
+   $invoices = Invoice::whereCompany()
+       ->applyFilters($request->all())
+       ->with('customer')       // 列表只预加载 customer
+       ->latest()
+       ->paginateData($limit);
+   ```
+
 3. **前端 store 中的"扁平化"操作**
    有些 store action 会把嵌套数据提取到顶层，这是**前端业务需要**，不是后端序列化的行为。
 
-   例：[invoice.js](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stores/invoice.js) 中的 `selectCustomer`：
+   **代码证据**：`resources/scripts/admin/stores/invoice.js` 第 411-425 行（`selectCustomer`）
+
    ```js
    selectCustomer(id) {
-     return http.get(`/api/v1/customers/${id}`)
-       .then((response) => {
-         this.newInvoice.customer = response.data.data    // 保存完整对象
-         this.newInvoice.customer_id = response.data.data.id  // 同时保存 id 到顶层
-       })
+     return new Promise((resolve, reject) => {
+       http
+         .get(`/api/v1/customers/${id}`)
+         .then((response) => {
+           this.newInvoice.customer = response.data.data      // 保存完整嵌套对象
+           this.newInvoice.customer_id = response.data.data.id // 同时保存 id 到顶层
+           resolve(response)
+         })
+     })
    }
    ```
 
@@ -488,23 +767,34 @@ export default function () {
    │
    ▼
 2. 路由 → InvoicesController@show
+   「代码位置」：routes/api.php → InvoicesController::show
    │
    ▼
 3. 路由模型绑定 → 从数据库查询 Invoice Model
+   「Laravel 隐式模型绑定」
    │
    ▼
 4. 策略授权 → 检查用户是否有权限查看
+   「代码位置」：app/Policies/InvoicePolicy.php
    │
    ▼
 5. 返回 new InvoiceResource($invoice)
+   「代码位置」：app/Http/Resources/InvoiceResource.php
    │
    ├─ 基础字段：id, invoice_number, invoice_date, status...
+   │  「代码位置」：InvoiceResource.php 第 18-50 行
    ├─ 访问器字段：formatted_invoice_date, invoice_pdf_url, allow_edit...
+   │  「代码位置」：InvoiceResource.php 第 51-59 行
+   │                  + Invoice.php 第 126-162 行（访问器实现）
    └─ 条件嵌套：
       ├─ customer → CustomerResource（如果关联存在）
+      │  「代码位置」：InvoiceResource.php 第 63-65 行
       ├─ items → InvoiceItemResource[]（如果关联存在）
-      │   └─ items[].taxes → TaxResource[]
+      │  「代码位置」：InvoiceResource.php 第 60-62 行
+      │  └─ items[].taxes → TaxResource[]
+      │     「代码位置」：InvoiceItemResource.php 第 38-40 行
       └─ taxes → TaxResource[]
+         「代码位置」：InvoiceResource.php 第 69-71 行
    │
    ▼
 6. JSON 响应 → { "data": { ... } }
@@ -514,36 +804,45 @@ export default function () {
 
 ```
 1. 进入 /invoices/123 路由
+   「代码位置」：resources/scripts/admin/admin-router.js
    │
    ▼
-2. 组件 mounted / onMounted → 调用 invoiceStore.fetchInvoiceInitialSettings(true)
+2. 组件 onMounted → 调用 invoiceStore.fetchInvoiceInitialSettings(true)
+   「代码位置」：resources/scripts/admin/views/.../View.vue
    │
    ▼
-3. fetchInvoice(route.params.id)
+3. fetchInvoiceInitialSettings(true) → 调用 fetchInvoice(route.params.id)
+   「代码位置」：resources/scripts/admin/stores/invoice.js 第 485-576 行
+   │
+   ▼
+4. fetchInvoice(id)
+   「代码位置」：resources/scripts/admin/stores/invoice.js 第 138-152 行
    │
    ├─ http.get(`/api/v1/invoices/${id}`)
-   │  │
-   │  ▼
-   │  Axios 请求 → 带上 Authorization token 和 company header
+   │  「代码位置」：resources/scripts/http/index.js
    │
    ▼
-4. 收到响应 response.data.data
+5. 收到响应 response.data.data
    │
    ▼
-5. setInvoiceData(response.data.data)
+6. setInvoiceData(response.data.data)
+   「代码位置」：resources/scripts/admin/stores/invoice.js 第 154-173 行
    │
    ├─ Object.assign(this.newInvoice, invoice)
    │  → 把后端数据合并到 stub 初始化的对象上
    │
    ├─ 补充前端 UI 需要的空 tax 项
+   │  「代码位置」：invoice.js 第 157-162 行
    └─ 折扣单位转换等前端特有逻辑
+      「代码位置」：invoice.js 第 164-172 行
    │
    ▼
-6. setCustomerAddresses(customer)
-   → 从 customer.customer_business 提取 billing/shipping address
+7. setCustomerAddresses(customer)
+   → 从 customer 对象中提取地址相关信息
+   「代码位置」：invoice.js 第 175-185 行
    │
    ▼
-7. 视图组件使用 newInvoice 渲染表单
+8. 视图组件使用 newInvoice 渲染表单
    → v-model 双向绑定各字段
 ```
 
@@ -551,71 +850,121 @@ export default function () {
 
 ## 七、Customer 模块对比验证
 
-以 Customer 为例验证上述模式是否一致：
+以 Customer 为例验证上述模式是否一致，确认这是项目的统一模式。
 
-### 后端 CustomerResource
+### 7.1 后端 CustomerResource
 
-[CustomerResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/CustomerResource.php)
+**代码证据**：`app/Http/Resources/CustomerResource.php` 第 8-57 行
 
 ```php
-return [
-    // 基础字段
-    'id' => $this->id,
-    'name' => $this->name,
-    'email' => $this->email,
-    // ...
-    
-    // 访问器字段
-    'formatted_created_at' => $this->formattedCreatedAt,
-    'password_added' => $this->password ? true : false,
-    
-    // 嵌套关系
-    'billing' => $this->when($this->billingAddress()->exists(), function () {
-        return new AddressResource($this->billingAddress);
-    }),
-    'shipping' => $this->when($this->shippingAddress()->exists(), function () {
-        return new AddressResource($this->shippingAddress);
-    }),
-    'currency' => $this->when($this->currency()->exists(), function () {
-        return new CurrencyResource($this->currency);
-    }),
-];
-```
+class CustomerResource extends JsonResource
+{
+    public function toArray($request): array
+    {
+        return [
+            // 基础字段（第 18-38 行）
+            'id' => $this->id,
+            'name' => $this->name,
+            'email' => $this->email,
+            'phone' => $this->phone,
+            'currency_id' => $this->currency_id,
+            // ...
 
-### 前端 customer store
+            // 访问器字段（第 33, 36-37 行）
+            'formatted_created_at' => $this->formattedCreatedAt,
+            'due_amount' => $this->due_amount,
+            'password_added' => $this->password ? true : false,
 
-[customer.js store](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stores/customer.js)
-
-```js
-fetchCustomer(id) {
-  return http.get(`/api/v1/customers/${id}`)
-    .then((response) => {
-      Object.assign(this.currentCustomer, response.data.data)
-      this.setAddressStub(response.data.data)
-    })
+            // 嵌套关系（第 40-54 行）
+            'billing' => $this->when($this->billingAddress()->exists(), function () {
+                return new AddressResource($this->billingAddress);
+            }),
+            'shipping' => $this->when($this->shippingAddress()->exists(), function () {
+                return new AddressResource($this->shippingAddress);
+            }),
+            'currency' => $this->when($this->currency()->exists(), function () {
+                return new CurrencyResource($this->currency);
+            }),
+        ];
+    }
 }
 ```
 
-### 前端 customer stub
+对应的模型关系：
 
-[customer.js stub](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stub/customer.js)
+**代码证据**：`app/Models/Customer.php` 第 87-120 行
+
+```php
+public function addresses(): HasMany
+{
+    return $this->hasMany(Address::class);
+}
+
+public function billingAddress(): HasOne
+{
+    return $this->hasOne(Address::class)->where('type', Address::BILLING_TYPE);
+}
+
+public function shippingAddress(): HasOne
+{
+    return $this->hasOne(Address::class)->where('type', Address::SHIPPING_TYPE);
+}
+
+public function currency(): BelongsTo
+{
+    return $this->belongsTo(Currency::class);
+}
+```
+
+### 7.2 前端 customer store
+
+**代码证据**：`resources/scripts/admin/stores/customer.js` 第 112-124 行
 
 ```js
+fetchCustomer(id) {
+  return new Promise((resolve, reject) => {
+    http
+      .get(`/api/v1/customers/${id}`)
+      .then((response) => {
+        Object.assign(this.currentCustomer, response.data.data)
+        this.setAddressStub(response.data.data)
+        resolve(response)
+      })
+  })
+}
+```
+
+### 7.3 前端 customer stub
+
+**代码证据**：`resources/scripts/admin/stub/customer.js` 第 1-19 行
+
+```js
+import addressStub from '@/scripts/admin/stub/address.js'
+
 export default function () {
   return {
     name: '',
+    contact_name: '',
     email: '',
+    phone: null,
+    password: '',
+    confirm_password: '',
     currency_id: null,
+    website: null,
     billing: { ...addressStub },    // 与后端 billing 嵌套对应
     shipping: { ...addressStub },   // 与后端 shipping 嵌套对应
     customFields: [],               // 前端专用
+    fields: [],
     enable_portal: false,
-    // ...
   }
 }
 ```
 
-**验证结论：** Customer 模块与 Invoice 模块遵循完全相同的模式。
+**验证结论**：Customer 模块与 Invoice 模块遵循完全相同的模式：
+- 后端 Resource 定义嵌套字段结构
+- 前端 stub 定义对应的数据模板
+- Store 通过 `Object.assign` 合并 API 数据
+- 前端有自己的额外字段
 
 ---
 
@@ -628,12 +977,35 @@ export default function () {
 - 详情接口有 `items` 字段（因为预加载了）
 - 前端访问时要做空值判断：`invoice.items?.forEach(...)`
 
+**代码证据**：`app/Http/Resources/InvoiceResource.php` 第 60-62 行
+
+```php
+'items' => $this->when($this->items()->exists(), function () {
+    return InvoiceItemResource::collection($this->items);
+}),
+```
+
 ### 8.2 前端额外字段
 
 Stub 中定义但后端没有的字段，在 `Object.assign` 后会保留。常见的前端专用字段：
-- `selectedNote`, `selectedCurrency` — UI 选中状态
-- `customFields` — 自定义字段的前端表示
-- 临时的 `id`（用 Guid 生成，前端用，后端会忽略）
+
+| 字段 | 所在 stub | 用途 |
+|------|----------|------|
+| `selectedNote` | invoice stub | UI 选中的备注 |
+| `selectedCurrency` | invoice stub | UI 选中的货币显示 |
+| `customFields` | 多个 stub | 自定义字段的前端表示 |
+| `title` | invoice-item stub | 行项目显示标题（内部用） |
+| `totalTax` | invoice-item stub | 前端计算的总税额 |
+| Guid 生成的 `id` | 多个子 stub | 前端临时 ID，新增项用 |
+
+**代码证据**：`resources/scripts/admin/stub/invoice.js` 第 35-38 行
+
+```js
+customFields: [],
+fields: [],
+selectedNote: null,
+selectedCurrency: '',
+```
 
 ### 8.3 数据提交方向
 
@@ -641,37 +1013,61 @@ Stub 中定义但后端没有的字段，在 `Object.assign` 后会保留。常�
 
 例：创建发票时，前端提交的数据包含 `items` 数组，后端 `Invoice::createInvoice()` 会处理嵌套的 items 和 taxes。
 
+**代码证据**：`app/Models/Invoice.php` 第 326-373 行（`createInvoice` 静态方法）
+
+```php
+public static function createInvoice($request)
+{
+    $data = $request->getInvoicePayload();
+    $invoice = Invoice::create($data);
+    // ...
+    self::createItems($invoice, $request->items);   // 处理嵌套 items
+    // ...
+    if ($request->has('taxes') && (! empty($request->taxes))) {
+        self::createTaxes($invoice, $request->taxes); // 处理嵌套 taxes
+    }
+    // ...
+    return $invoice;
+}
+```
+
 ### 8.4 两套资源类
 
-项目中有两套资源类：
-- `app/Http/Resources/*.php` — 管理后台使用（Admin）
-- `app/Http/Resources/Customer/*.php` — 客户门户使用（Customer Portal）
+项目中有两套资源类，分别对应管理后台和客户门户：
 
-客户门户的资源类字段可能更少（安全考虑）。
+| 路径 | 使用者 | 说明 |
+|------|--------|------|
+| `app/Http/Resources/*.php` | 管理后台（Admin） | 字段最全，用于内部管理 |
+| `app/Http/Resources/Customer/*.php` | 客户门户（Customer Portal） | 字段可能更少，更安全 |
+
+**代码证据**：`app/Http/Resources/Customer/InvoiceResource.php` 与 `app/Http/Resources/InvoiceResource.php` 对比可发现字段差异。
 
 ---
 
 ## 九、文件索引
 
-### 后端
-| 文件 | 作用 |
-|------|------|
-| [InvoiceResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/InvoiceResource.php) | 发票资源序列化 |
-| [CustomerResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/CustomerResource.php) | 客户资源序列化 |
-| [InvoiceItemResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/InvoiceItemResource.php) | 发票行项目资源 |
-| [TaxResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/TaxResource.php) | 税费资源 |
-| [AddressResource.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Resources/AddressResource.php) | 地址资源 |
-| [Invoice.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Models/Invoice.php) | 发票模型（含访问器） |
-| [Customer.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Models/Customer.php) | 客户模型 |
-| [InvoicesController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php) | 发票控制器 |
+### 9.1 后端
 
-### 前端
-| 文件 | 作用 |
-|------|------|
-| [invoice.js store](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stores/invoice.js) | 发票 Pinia Store |
-| [customer.js store](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stores/customer.js) | 客户 Pinia Store |
-| [invoice.js stub](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stub/invoice.js) | 发票数据桩 |
-| [customer.js stub](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stub/customer.js) | 客户数据桩 |
-| [invoice-item.js stub](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stub/invoice-item.js) | 发票行项目数据桩 |
-| [address.js stub](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/admin/stub/address.js) | 地址数据桩 |
-| [http/index.js](file:///d:/fz/0508-2/solo-dogfeeding/code/125-InvoiceShelf/resources/scripts/http/index.js) | Axios HTTP 封装 |
+| 文件路径 | 作用 | 关键行 |
+|---------|------|--------|
+| `app/Http/Resources/InvoiceResource.php` | 发票资源序列化 | 第 15-81 行（toArray 方法） |
+| `app/Http/Resources/CustomerResource.php` | 客户资源序列化 | 第 15-55 行（toArray 方法） |
+| `app/Http/Resources/InvoiceItemResource.php` | 发票行项目资源 | 第 15-44 行 |
+| `app/Http/Resources/TaxResource.php` | 税费资源 | 第 15-42 行 |
+| `app/Http/Resources/AddressResource.php` | 地址资源 | 第 15-38 行 |
+| `app/Models/Invoice.php` | 发票模型（含访问器） | 第 56-62 行（appends）、第 126-162 行（访问器）、第 86-124 行（关系） |
+| `app/Models/Customer.php` | 客户模型 | 第 87-120 行（地址关系）、第 53-58 行（访问器） |
+| `app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php` | 发票控制器 | 第 21-37 行（index）、第 65-70 行（show） |
+| `app/Http/Resources/InvoiceCollection.php` | 发票资源集合类 | 第 15-17 行 |
+
+### 9.2 前端
+
+| 文件路径 | 作用 | 关键行 |
+|---------|------|--------|
+| `resources/scripts/admin/stores/invoice.js` | 发票 Pinia Store | 第 26-99 行（state/getters）、第 122-173 行（核心 actions） |
+| `resources/scripts/admin/stores/customer.js` | 客户 Pinia Store | 第 112-124 行（fetchCustomer） |
+| `resources/scripts/admin/stub/invoice.js` | 发票数据桩 | 第 5-39 行（默认结构） |
+| `resources/scripts/admin/stub/customer.js` | 客户数据桩 | 第 3-18 行（默认结构） |
+| `resources/scripts/admin/stub/invoice-item.js` | 发票行项目数据桩 | 第 1-17 行 |
+| `resources/scripts/admin/stub/address.js` | 地址数据桩 | 第 1-10 行 |
+| `resources/scripts/http/index.js` | Axios HTTP 封装 | 第 6-28 行（实例+拦截器） |
