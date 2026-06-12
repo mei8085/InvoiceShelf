@@ -269,9 +269,318 @@ const getTypeComponent = computed(() => {
 
 ---
 
-## 三、查询过滤与输出
+## 三、查询过滤链路深度解析
 
-### 3.1 API 层
+### 3.1 字段定义列表筛选完整链路
+
+字段定义列表筛选是整个自定义字段系统的"入口"，它决定了在特定业务场景下应该显示哪些自定义字段。整个链路从前端发起请求到后端返回数据，经过多个层次：
+
+#### 触发时机
+
+字段定义筛选在以下场景被触发：
+
+1. **单据表单加载**：进入发票/报价单/客户创建或编辑页面时
+2. **PDF 生成**：生成 PDF 时查询条目自定义字段
+3. **自定义字段管理页**：按模型类型筛选显示字段
+4. **富文本编辑器**：BaseCustomInput 按模型类型分组显示可插入字段
+
+#### 完整链路追踪（以 Invoice 表单为例）
+
+```
+前端发起请求
+  ↓
+[CreateCustomFields.vue#L52-L61]
+  onMounted(() => {
+    customFieldStore.fetchCustomFields({ type: props.type, limit: 'all' })
+  })
+  ↓
+[custom-field.js#L40-L53]
+  fetchCustomFields(params) {
+    http.get(`/api/v1/custom-fields`, { params })
+      → GET /api/v1/custom-fields?type=Invoice&limit=all
+  }
+  ↓
+后端路由处理
+  ↓
+[CustomFieldsController.php#L33-L48]
+  public function index(Request $request) {
+    $customFields = CustomField::whereCompany()
+      ->applyFilters($request->all())
+      ->latest()
+      ->paginateData($limit);
+    return CustomFieldResource::collection($customFields);
+  }
+  ↓
+[CustomField.php#L90-L106]
+  public function scopeApplyFilters($query, array $filters) {
+    $filters = collect($filters);
+    if ($filters->get('type')) {
+      $query->whereType($filters->get('type'));  // 关键：按 model_type 过滤
+    }
+    if ($filters->get('search')) {
+      $query->whereSearch($filters->get('search'));
+    }
+  }
+  ↓
+[CustomField.php#L104-L107]
+  public function scopeWhereType($query, $type) {
+    $query->where('custom_fields.model_type', $type);
+  }
+  ↓
+返回结果（通过 CustomFieldResource）
+  → 包含所有 6 个 answer 列 + default_answer 计算属性
+```
+
+#### `model_type` 过滤的关键参数
+
+请求参数 `type` 与数据库 `model_type` 列的对应关系：
+
+| 前端 type 参数 | 数据库 model_type | 适用场景 |
+|---|---|---|
+| `'Customer'` | `'Customer'` | 客户表单 |
+| `'Invoice'` | `'Invoice'` | 发票主表单 |
+| `'Estimate'` | `'Estimate'` | 报价单主表单 |
+| `'Expense'` | `'Expense'` | 支出表单 |
+| `'Payment'` | `'Payment'` | 付款表单 |
+| `'Item'` | `'Item'` | **条目（InvoiceItem/EstimateItem）** |
+
+> **注意**：条目级自定义字段使用 `model_type = 'Item'`，但实际存储在 `InvoiceItem` 或 `EstimateItem` 上，通过多态关联的 `custom_field_valuable_type` 区分。
+
+#### 筛选边界
+
+- **公司隔离**：所有查询都通过 `scopeWhereCompany()` 按 `company_id` 过滤（多租户隔离）
+- **排序**：默认 `latest()` 按创建时间倒序，前端再按 `order` 字段重新排序
+- **分页**：支持 `limit=all` 返回全部，用于表单渲染场景
+
+---
+
+### 3.2 单据实际查询完整链路
+
+单据查询是指从数据库加载业务单据（Invoice、Customer 等）及其自定义字段值的过程。不同的查询场景（列表页、详情页、创建/更新后返回）有不同的 eager loading 策略，这直接影响自定义字段值的加载时机和性能。
+
+#### 三种查询场景对比
+
+| 场景 | 触发位置 | eager loading 策略 | 自定义字段加载方式 | 潜在问题 |
+|---|---|---|---|---|
+| **列表页 (index)** | [InvoicesController@index](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php#L27-L31) | `with('customer')` | **不加载** | 列表看不到自定义字段值 |
+| **详情页 (show)** | [InvoicesController@show](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Http/Controllers/V1/Admin/Invoice/InvoicesController.php#L65-L70) | 无（直接返回模型） | Resource 中 `$this->fields()->exists()` 懒加载 | **N+1 查询问题** |
+| **创建/更新后返回** | [Invoice::createInvoice()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/Invoice.php#L363-L370) | `with('items', 'items.fields', 'items.fields.customField')` | **深度 eager load** | 性能最优 |
+
+#### 场景 1：列表页查询（自定义字段不可用）
+
+```php
+// InvoicesController@index
+$invoices = Invoice::whereCompany()
+    ->applyFilters($request->all())
+    ->with('customer')           // 只 eager load customer
+    ->latest()
+    ->paginateData($limit);
+
+return InvoiceResource::collection($invoices)
+```
+
+**为什么列表页不加载自定义字段？**
+
+- 列表页通常显示摘要信息，不需要完整的自定义字段
+- 减少列表查询的数据量和复杂度
+- 这是**有意的性能优化**，但也意味着列表页无法通过自定义字段过滤或显示
+
+#### 场景 2：详情页查询（存在 N+1 问题）
+
+```php
+// InvoicesController@show
+return new InvoiceResource($invoice);  // 无 eager loading
+```
+
+```php
+// InvoiceResource@toArray
+'fields' => $this->when($this->fields()->exists(), function () {
+    return CustomFieldValueResource::collection($this->fields);
+}),
+```
+
+**N+1 问题分析**：
+
+1. 首先查询 `$this->fields()->exists()` — 第 1 条查询
+2. 然后查询 `$this->fields` — 第 2 条查询
+3. 每个 `CustomFieldValueResource` 内部可能访问 `customField` 关系 — 如果不 eager load，每个值又多一条查询
+
+这意味着一个单据详情页至少有 **3 条额外 SQL 查询**。对于发票详情页，还包括：
+- Invoice 本身的 fields（1+N）
+- 每个 InvoiceItem 的 fields（每个条目 1+N）
+
+#### 场景 3：创建/更新后返回（深度 eager load）
+
+```php
+// Invoice::createInvoice
+$invoice = self::with([
+    'items',
+    'items.fields',           // eager load 条目自定义字段值
+    'items.fields.customField', // eager load 字段定义（避免 N+1）
+    'customer',
+    'taxes',
+])->find($invoice->id);
+
+return $invoice;
+```
+
+**三层 eager loading 解析**：
+
+```
+Invoice
+  ↳ items (InvoiceItem 集合)
+      ↳ fields (CustomFieldValue 集合，通过 morphMany)
+          ↳ customField (CustomField 定义，用于获取 label 和 slug)
+```
+
+这意味着：
+- `$invoice->items` 不会产生额外查询
+- `$item->fields` 不会产生额外查询
+- `$field->customField` 不会产生额外查询
+
+**性能对比**：
+
+| 查询方式 | SQL 查询数量（不含主查询） | 数据量 | 适用场景 |
+|---|---|---|---|
+| 列表页（无 eager load） | 0 | 小 | 列表浏览 |
+| 详情页（懒加载） | 3+ | 中 | 详情查看 |
+| 创建/更新后（深度 eager load） | 3（固定） | 大 | 表单回填 |
+
+#### 条目自定义字段查询链路
+
+```php
+// InvoiceItemResource@toArray
+'fields' => $this->when($this->fields()->exists(), function () {
+    return CustomFieldValueResource::collection($this->fields);
+}),
+```
+
+```php
+// 读取值
+$item->getCustomFieldValueBySlug($field->slug)
+  ↓
+// HasCustomFieldsTrait@getCustomFieldValueBySlug
+public function getCustomFieldValueBySlug($slug)
+{
+    $customField = CustomField::where('slug', $slug)->first();
+    if ($customField) {
+        $customFieldValue = $this->fields()
+            ->where('custom_field_id', $customField->id)
+            ->first();
+        if ($customFieldValue) {
+            return $customFieldValue->defaultAnswer;
+        }
+    }
+    return '';
+}
+```
+
+**注意**：`getCustomFieldValueBySlug()` 每次调用都会执行两条查询：
+1. `CustomField::where('slug', $slug)->first()` — 查找字段定义
+2. `$this->fields()->where('custom_field_id', ...)->first()` — 查找值
+
+如果在循环中调用（如 PDF 表格渲染），会产生严重的 N+1 问题。
+
+---
+
+### 3.3 条目字段在 PDF 输出里的消费边界
+
+条目（Item）类型的自定义字段是一个特殊的存在——它的存储能力完整，但前端输入 UI 缺失，主要消费场景仅限于 PDF 输出。
+
+#### 条目自定义字段的"半完成"状态
+
+| 能力 | 是否支持 | 说明 |
+|---|---|---|
+| ✅ 字段定义（CustomField） | 是 | `model_type = 'Item'` 的字段可以在设置页创建 |
+| ✅ 存储结构 | 是 | InvoiceItem/EstimateItem 使用 HasCustomFieldsTrait |
+| ✅ 数据库写入 | 是 | `Invoice::createItems()` 处理 `$invoiceItem['custom_fields']` |
+| ✅ 数据库读取 | 是 | `getCustomFieldValueBySlug()` 可用 |
+| ✅ PDF 表格输出 | 是 | 唯一完整的消费场景 |
+| ❌ 前端表单输入 | **否** | CreateItemRow.vue 中无自定义字段 UI |
+| ❌ 列表页显示 | 否 | 列表页不加载 |
+| ❌ 详情页显示 | 否 | 详情页无条目自定义字段展示区域 |
+| ❌ 富文本插入 | 否 | BaseCustomInput 不包含 Item 类型字段 |
+| ❌ 模板变量替换 | **部分** | 仅 Invoice 级字段，不包含 Item 级 |
+
+#### PDF 输出完整链路
+
+```
+PDF 生成触发
+  ↓
+[Invoice::getPDFData()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/Invoice.php#L562-L596)
+  $customFields = CustomField::where('model_type', 'Item')->get();
+  view()->share(['customFields' => $customFields, ...]);
+  ↓
+Blade 模板渲染
+  ↓
+[table.blade.php#L3-L7]
+  <!-- 表头渲染：遍历所有 Item 类型自定义字段生成列 -->
+  @foreach($customFields as $field)
+      <th class="text-right item-table-heading">{{ $field->label }}</th>
+  @endforeach
+  ↓
+[table.blade.php#L36-L40]
+  <!-- 表体渲染：每个条目遍历字段读取值 -->
+  @foreach($customFields as $field)
+      <td class="text-right item-cell" style="vertical-align: top;">
+          {{ $item->getCustomFieldValueBySlug($field->slug) }}
+      </td>
+  @endforeach
+```
+
+#### 消费边界分析
+
+**边界 1：仅 PDF 表格，不支持模板变量**
+
+- ✅ PDF 表格中：每个条目行的每个自定义字段作为独立列显示
+- ❌ 模板变量中：`{CUSTOM_ITEM_XXX}` 不可用，因为 [GeneratesPdfTrait::getFieldsArray()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Traits/GeneratesPdfTrait.php#L154-L163) 只处理 `$this->fields`（Invoice 级），不处理 `$this->items->fields`（Item 级）
+
+**边界 2：前端输入 UI 缺失**
+
+虽然后端存储完整支持条目自定义字段，但前端存在两处缺失：
+
+1. **[CreateItemRow.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue)** 没有渲染条目级自定义字段的输入区域
+2. **[invoice-item.js](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/stub/invoice-item.js)** 中没有 `customFields` 字段定义
+
+这意味着：
+- 用户无法通过前端界面填写条目自定义字段
+- 只能通过 API 直接调用或数据导入的方式填充
+- PDF 中如果定义了条目自定义字段但没有值，会显示空白列
+
+**边界 3：仅 InvoiceItem 和 EstimateItem**
+
+条目自定义字段仅适用于：
+- `model_type = 'Item'` 的 CustomField 定义
+- `custom_field_valuable_type = 'App\Models\InvoiceItem'` 或 `'App\Models\EstimateItem'` 的值记录
+
+**不适用于**：
+- `App\Models\Item`（商品库模型本身没有 HasCustomFieldsTrait）
+- 其他业务模型的条目
+
+**边界 4：N+1 性能问题**
+
+PDF 表格渲染时，每个条目 × 每个字段调用一次 `getCustomFieldValueBySlug()`，每次调用执行 2 条 SQL：
+
+```
+假设有 3 个条目自定义字段，10 个条目：
+10 条目 × 3 字段 × 2 SQL = 60 条额外查询
++ 1 条查询获取所有 Item 类型自定义字段定义
+= 总计 61 条 SQL（不含主查询）
+```
+
+优化方向：在 `getPDFData()` 中 eager load `items.fields.customField`，然后通过 collection 操作取值，避免循环查询。
+
+#### 为什么会有这种半完成状态？
+
+从代码考古来看，条目自定义字段的设计意图是：
+1. 后端先实现了完整的存储和读取能力（遵循 DRY 原则，复用 HasCustomFieldsTrait）
+2. PDF 输出作为最核心的消费场景优先实现
+3. 前端输入 UI 可能因为优先级或复杂度原因暂未实现
+4. 形成了"存储能力 > 消费能力"的不对称状态
+
+---
+
+### 3.4 API 层（原 3.1 顺序调整）
 
 #### 自定义字段 CRUD
 
@@ -532,3 +841,54 @@ Switch 类型在前端和后端之间需要进行 Boolean ↔ Integer 的转换�
 | 5 | 测试 | 确保存储、渲染、输出三层一致 |
 
 **无需修改**：数据库迁移（复用现有 `string_answer` 列）、Model、Trait、Resource — 这是该架构的核心优势。
+
+---
+
+## 八、扩展：补全条目自定义字段前端输入能力
+
+如前所述，条目（Item）自定义字段的存储能力完整，但前端输入 UI 缺失。如果需要补全这一能力，需按以下步骤修改：
+
+| 步骤 | 位置 | 操作 |
+|---|---|---|
+| 1 | [invoice-item.js](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/stub/invoice-item.js) | 添加 `customFields: []` 字段 |
+| 2 | [CreateItemRow.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue) | 在商品选择下方添加 `<CreateCustomFields type="Item" :store="store" :store-prop="storeProp" :invoice-id="id" :fields="itemData.fields" />` |
+| 3 | [CreateCustomFields.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/custom-fields/CreateCustomFields.vue) | 支持将值保存到 `itemData.customFields` 而非 `store[storeProp].customFields` |
+| 4 | [invoice.js](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/stores/invoice.js) `addInvoice()` / `updateInvoice()` | 在提交数据时包含每个 item 的 `customFields` |
+| 5 | [InvoicesRequest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Http/Requests/InvoicesRequest.php) | 添加 `items.*.customFields` 验证规则 |
+| 6 | 测试 | 确保条目自定义字段可以正常创建、编辑、显示 |
+
+**无需修改**：后端存储逻辑（`Invoice::createItems()` 已支持 `custom_fields` 参数）、PDF 输出逻辑（已完整实现）。
+
+---
+
+## 九、总结：三位一体全景图
+
+```
+                   ┌───────────────────────────────────────┐
+                   │          getCustomFieldValueKey()       │
+                   │      类型 → 列名映射（核心路由表）       │
+                   └──────────┬───────────┬───────────┬─────┘
+                              │           │           │
+                   ┌──────────▼──┐  ┌────▼─────┐  ┌──▼───────────┐
+                   │  存储层适配   │  │ 渲染层适配 │  │ 输出层适配    │
+                   │  确定写入列   │  │ 确定组件   │  │ 确定格式化   │
+                   └──────────────┘  └───────────┘  └──────────────┘
+                          │              │                │
+   ┌──────────────────────┼──────────────┼────────────────┼─────────────────────┐
+   │                      │              │                │                     │
+   ▼                      ▼              ▼                ▼                     ▼
+┌───────────┐    ┌──────────────┐  ┌───────────┐  ┌──────────────┐    ┌──────────────┐
+│ EAV 双表   │    │  model_type  │  │ 动态组件   │  │ Resource 层   │    │ PDF 输出      │
+│ 存储       │    │  筛选         │  │ 分发       │  │ 格式化        │    │ 边界          │
+└───────────┘    └──────────────┘  └───────────┘  └──────────────┘    └──────────────┘
+                          │                                      │
+                          ▼                                      ▼
+                  ┌───────────────────┐                ┌───────────────────┐
+                  │ 三种查询场景：      │                │ 四条消费边界：      │
+                  │ • 列表页（不加载） │                │ • 仅 PDF 表格       │
+                  │ • 详情页（懒加载） │                │ • 无前端 UI         │
+                  │ • 创建后（深度加载）│                │ • 仅 InvoiceItem    │
+                  └───────────────────┘                │ • N+1 性能问题      │
+                                                          └───────────────────┘
+```
+
