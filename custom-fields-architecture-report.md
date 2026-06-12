@@ -593,12 +593,12 @@ Blade 模板渲染
 - ✅ PDF 表格中：每个条目行的每个自定义字段作为独立列显示
 - ❌ 模板变量中：`{CUSTOM_ITEM_XXX}` 不可用，因为 [GeneratesPdfTrait::getFieldsArray()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Traits/GeneratesPdfTrait.php#L154-L163) 只处理 `$this->fields`（Invoice 级），不处理 `$this->items->fields`（Item 级）
 
-**边界 2：前端输入 UI 缺失**
+**边界 2：前端双层缺失——无法创建也无法输入**
 
-虽然后端存储完整支持条目自定义字段，但前端存在两处缺失：
+条目自定义字段在前端存在双层缺失：
 
-1. **[CreateItemRow.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue)** 没有渲染条目级自定义字段的输入区域
-2. **[invoice-item.js](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/stub/invoice-item.js)** 中没有 `customFields` 字段定义
+1. **创建层缺失**：[CustomFieldModal.vue#L232-L238](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/modal-components/custom-fields/CustomFieldModal.vue#L232-L238) 的 `modelTypes` 下拉框不包含 Item 选项，用户无法创建条目类型的自定义字段定义
+2. **输入层缺失**：[CreateItemRow.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue) 没有渲染条目级自定义字段的输入区域，[invoice-item.js](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/stub/invoice-item.js) 中也没有 `customFields` 字段定义
 
 这意味着：
 - 用户无法通过前端界面填写条目自定义字段
@@ -902,7 +902,219 @@ Switch 类型在前端和后端之间需要进行 Boolean ↔ Integer 的转换�
 
 ---
 
-## 八、扩展：补全条目自定义字段前端输入能力
+## 八、模型分支差异：Expense 与 RecurringInvoice
+
+### 8.1 Expense 的入参形态差异：FormData + json_decode
+
+Expense 模型在自定义字段的写入链路上与其他模型存在一个关键的入参形态差异——它因为需要上传附件（receipt），使用 `FormData` 而非 JSON 提交，导致 `customFields` 的编码/解码方式完全不同。
+
+#### 差异根源：文件上传迫使 FormData
+
+Expense 表单包含文件上传字段（`attachment_receipt`），因此无法使用常规的 `application/json` 请求，必须使用 `multipart/form-data`。这导致整个表单数据需要通过 `FormData` 对象提交：
+
+```js
+// expense.js#L116-L117
+addExpense(data) {
+    const formData = utils.toFormData(data)    // ← 转为 FormData
+    http.post('/api/v1/expenses', formData)
+}
+```
+
+#### toFormData 的序列化策略
+
+[utilities.js#L262-L279](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/helpers/utilities.js#L262-L279) 中 `toFormData()` 对数组类型字段做了 `JSON.stringify()` 处理：
+
+```js
+toFormData(object) {
+    const formData = new FormData()
+    Object.keys(object).forEach((key) => {
+        if (isArray(object[key])) {
+            formData.append(key, JSON.stringify(object[key]))  // ← 数组被 JSON 序列化
+        } else {
+            formData.append(key, object[key])
+        }
+    })
+    return formData
+}
+```
+
+这意味着 `customFields: [{id: 1, value: "xxx"}, {id: 2, value: 1}]` 在提交时被序列化为字符串：
+
+```
+customFields = "[{\"id\":1,\"value\":\"xxx\"},{\"id\":2,\"value\":1}]"
+```
+
+#### 后端解码：json_decode
+
+因为 FormData 中的数组字段变成了 JSON 字符串，Expense 后端必须显式调用 `json_decode()` 还原：
+
+```php
+// Expense.php#L250-L252
+if ($request->customFields) {
+    $expense->addCustomFields(json_decode($request->customFields));  // ← 显式 json_decode
+}
+```
+
+#### 与其他模型的对比
+
+| 模型 | 前端提交方式 | Content-Type | customFields 到达后端时的形态 | 后端处理方式 |
+|---|---|---|---|---|
+| **Invoice** | `http.post('/api/v1/invoices', data)` | `application/json` | PHP 数组 `[{id:1, value:"xxx"}]` | `$invoice->addCustomFields($request->customFields)` |
+| **Customer** | `http.post('/api/v1/customers', data)` | `application/json` | PHP 数组 | `$customer->addCustomFields($request->customFields)` |
+| **Estimate** | `http.put('/api/v1/estimates/{id}', data)` | `application/json` | PHP 数组 | `$estimate->addCustomFields($request->customFields)` |
+| **Payment** | `http.post('/api/v1/payments', data)` | `application/json` | PHP 数组 | `$payment->addCustomFields($request->customFields)` |
+| **Expense** | `http.post('/api/v1/expenses', formData)` | `multipart/form-data` | **JSON 字符串** `"[{\"id\":1,...}]"` | `$expense->addCustomFields(json_decode($request->customFields))` |
+| **RecurringInvoice** | `http.post('/api/v1/recurring-invoices', data)` | `application/json` | PHP 数组 | `$recurringInvoice->addCustomFields($request->customFields)` |
+
+#### 差异影响
+
+- **开发隐患**：如果在新模型中也使用 FormData 提交但忘记 `json_decode()`，`addCustomFields()` 收到的将是 JSON 字符串而非数组，遍历时会报错
+- **类型丢失**：`json_decode()` 默认返回 `stdClass` 对象而非关联数组，但 `addCustomFields()` 通过 `foreach` 遍历时两者兼容，不会出错
+- **更新路径一致**：`updateExpense()` 同样使用 FormData + `json_decode()` 模式
+
+#### 完整提交链路对比
+
+**Invoice（JSON 提交）：**
+```
+前端 data.customFields = [{id:1, value:"xxx"}, ...]
+  → http.post('/api/v1/invoices', data)           // Content-Type: application/json
+  → 后端 $request->customFields                     // 自动解析为 PHP 数组
+  → $invoice->addCustomFields($request->customFields)  // 直接传入
+```
+
+**Expense（FormData 提交）：**
+```
+前端 data.customFields = [{id:1, value:"xxx"}, ...]
+  → utils.toFormData(data)                          // 数组被 JSON.stringify() 序列化
+  → http.post('/api/v1/expenses', formData)         // Content-Type: multipart/form-data
+  → 后端 $request->customFields                     // 到达时是 JSON 字符串
+  → json_decode($request->customFields)             // 手动还原为数组
+  → $expense->addCustomFields(json_decode(...))     // 传入还原后的数组
+```
+
+---
+
+### 8.2 RecurringInvoice：单据级字段复制 vs 条目级字段断裂
+
+RecurringInvoice 在生成 Invoice 时，**单据级自定义字段被完整复制**，但**条目级自定义字段完全丢失**。这是整个自定义字段系统中最大的数据链路断裂。
+
+#### 单据级字段复制链路（已接通）
+
+[RecurringInvoice.php#L365-L376](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L365-L376) 的 `createInvoice()` 方法中，单据级自定义字段的复制逻辑如下：
+
+```php
+if ($this->fields()->exists()) {
+    $customField = [];
+
+    foreach ($this->fields as $data) {
+        $customField[] = [
+            'id' => $data->custom_field_id,
+            'value' => $data->defaultAnswer,
+        ];
+    }
+
+    $invoice->addCustomFields($customField);
+}
+```
+
+**复制策略**：
+
+1. 检查 RecurringInvoice 是否有自定义字段值
+2. 遍历每个值，构造 `['id' => 字段定义ID, 'value' => 实际值]` 数组
+3. 调用 `addCustomFields()` 将值写入新 Invoice
+
+**这个策略正确地绕过了多态关联的 owner 切换**：不是直接复制 `custom_field_values` 记录（那样会导致多态类型指向 RecurringInvoice），而是重新构造入参数组，让 `addCustomFields()` 以 Invoice 为 owner 创建新的值记录。
+
+#### 条目级字段断裂点（未接通）
+
+[RecurringInvoice.php#L358-L359](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L358-L359) 中，条目的复制逻辑如下：
+
+```php
+$this->load('items.taxes');
+Invoice::createItems($invoice, $this->items->toArray());
+```
+
+**断裂点分析**：
+
+1. **Eager Load 缺失**：`$this->load('items.taxes')` 只加载了 `items.taxes` 关系，**没有加载 `items.fields`**，导致 `$this->items->toArray()` 中不包含 `custom_fields` 数据
+
+2. **toArray() 不会包含未加载的关联**：Eloquent 的 `toArray()` 只序列化已加载的关联。由于 `items.fields` 没有被 eager load，序列化结果中不会有 `custom_fields` 键
+
+3. **Invoice::createItems() 的守门条件**：[Invoice.php#L535-L537](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/Invoice.php#L535-L537) 中有明确的判断：
+
+```php
+if (array_key_exists('custom_fields', $invoiceItem) && $invoiceItem['custom_fields']) {
+    $item->addCustomFields($invoiceItem['custom_fields']);
+}
+```
+
+由于 `toArray()` 不包含 `custom_fields` 键，`array_key_exists('custom_fields', $invoiceItem)` 返回 `false`，条目级自定义字段被完全跳过。
+
+#### 断裂链路可视化
+
+```
+RecurringInvoice.createInvoice()
+  │
+  ├── ✅ 单据级字段复制（已接通）
+  │   $this->fields()->exists()
+  │   foreach ($this->fields as $data) { ... }
+  │   $invoice->addCustomFields($customField)
+  │
+  ├── ❌ 条目级字段复制（断裂点 1：eager load 缺失）
+  │   $this->load('items.taxes')          ← 没有 'items.fields'
+  │   Invoice::createItems($invoice, $this->items->toArray())
+  │     │
+  │     └── ❌ 条目级字段写入（断裂点 2：toArray 不含 custom_fields）
+  │         array_key_exists('custom_fields', $invoiceItem)  ← false
+  │         → 条目字段被跳过
+  │
+  └── ✅ 税费复制
+      $this->taxes()->exists()
+      Invoice::createTaxes($invoice, $this->taxes->toArray())
+```
+
+#### 修复方案
+
+只需修改 [RecurringInvoice.php#L358](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L358) 一行代码：
+
+```php
+// 修复前：
+$this->load('items.taxes');
+
+// 修复后：
+$this->load('items.taxes', 'items.fields', 'items.fields.customField');
+```
+
+然后在 `$this->items->toArray()` 之前，需要手动将 `fields` 重组为 `custom_fields` 格式（因为 `toArray()` 序列化 `fields` 关系时的键名是 `fields` 而非 `custom_fields`，而 `Invoice::createItems()` 检查的键名是 `custom_fields`）：
+
+```php
+$this->load('items.taxes', 'items.fields', 'items.fields.customField');
+
+$itemsData = $this->items->map(function ($item) {
+    $itemArray = $item->toArray();
+    if ($item->fields->isNotEmpty()) {
+        $itemArray['custom_fields'] = $item->fields->map(function ($field) {
+            return [
+                'id' => $field->custom_field_id,
+                'value' => $field->defaultAnswer,
+            ];
+        })->toArray();
+    }
+    return $itemArray;
+})->toArray();
+
+Invoice::createItems($invoice, $itemsData);
+```
+
+#### 影响范围
+
+- **当前行为**：如果用户在 RecurringInvoice 的条目上通过 API 填充了自定义字段值，这些值在生成的 Invoice 中会**静默丢失**，不会有任何错误提示
+- **数据完整性**：已生成的 Invoice 条目上不会有对应的 `custom_field_values` 记录，PDF 输出中条目自定义字段列会显示为空
+- **用户感知**：由于前端无法为条目填写自定义字段（见第八章），当前这个断裂在正常使用流程中不可见，仅在使用 API 直接填充时才会暴露
+
+---
+
+## 九、扩展：补全条目自定义字段前端输入能力
 
 如前所述，条目（Item）自定义字段的存储能力完整，但前端输入 UI 缺失。如果需要补全这一能力，需按以下步骤修改：
 
