@@ -446,40 +446,76 @@ Invoice
 | 详情页（懒加载） | 3+ | 中 | 详情查看 |
 | 创建/更新后（深度 eager load） | 3（固定） | 大 | 表单回填 |
 
-#### 条目自定义字段查询链路
+#### 条目自定义字段按标识取值的真实查询路径
+
+PDF 表格中每个条目通过 `$item->getCustomFieldValueBySlug($field->slug)` 取值，**实际走的是 Eloquent 关联查询**，而非两条独立查询。代码实现位于 [HasCustomFieldsTrait.php#L64-L82](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Traits/HasCustomFieldsTrait.php#L64-L82)：
 
 ```php
-// InvoiceItemResource@toArray
-'fields' => $this->when($this->fields()->exists(), function () {
-    return CustomFieldValueResource::collection($this->fields);
-}),
-```
+// 第一步：通过 morphMany 关联 + whereHas 子查询过滤
+public function getCustomFieldBySlug($slug)
+{
+    return $this->fields()           // $this->morphMany(CustomFieldValue::class, 'custom_field_valuable')
+        ->with('customField')            // Eager Load: custom_field_values → custom_fields
+        ->whereHas('customField', function ($query) use ($slug) {
+            $query->where('slug', $slug);  // 通过 EXISTS 子查询按 slug 过滤
+        })
+        ->first();
+}
 
-```php
-// 读取值
-$item->getCustomFieldValueBySlug($field->slug)
-  ↓
-// HasCustomFieldsTrait@getCustomFieldValueBySlug
+// 第二步：取 defaultAnswer 访问器值
 public function getCustomFieldValueBySlug($slug)
 {
-    $customField = CustomField::where('slug', $slug)->first();
-    if ($customField) {
-        $customFieldValue = $this->fields()
-            ->where('custom_field_id', $customField->id)
-            ->first();
-        if ($customFieldValue) {
-            return $customFieldValue->defaultAnswer;
-        }
+    $value = $this->getCustomFieldBySlug($slug);
+
+    if ($value) {
+        return $value->defaultAnswer;
     }
-    return '';
+
+    return null;
 }
 ```
 
-**注意**：`getCustomFieldValueBySlug()` 每次调用都会执行两条查询：
-1. `CustomField::where('slug', $slug)->first()` — 查找字段定义
-2. `$this->fields()->where('custom_field_id', ...)->first()` — 查找值
+**真实 SQL 执行过程（以 InvoiceItem 为例）：
 
-如果在循环中调用（如 PDF 表格渲染），会产生严重的 N+1 问题。
+```sql
+-- 第 1 条 SQL：morphMany + whereHas 关联查询
+SELECT * FROM custom_field_values
+WHERE custom_field_valuable_type = 'App\Models\InvoiceItem'
+  AND custom_field_valuable_id = ?                      -- 当前条目 ID
+  AND EXISTS (
+      SELECT 1 FROM custom_fields
+      WHERE custom_fields.id = custom_field_values.custom_field_id
+        AND custom_fields.slug = ?                    -- slug 条件
+  )
+LIMIT 1;
+
+-- 第 2 条 SQL（来自 with('customField') 的 Eager Load）：
+SELECT * FROM custom_fields
+WHERE custom_fields.id IN (?);                        -- 上一步查到的 custom_field_id
+```
+
+**查询路径总结**：
+
+`getCustomFieldValueBySlug('CUSTOM_Item_Color')` 的完整调用链：
+
+```
+1. $this->fields()                           → morphMany 关系定义
+   → SELECT FROM custom_field_values WHERE type='InvoiceItem' AND id=?
+
+2. ->whereHas('customField', slug=?)         → EXISTS 子查询过滤
+   → 附加 AND EXISTS (SELECT 1 FROM custom_fields WHERE slug=?)
+
+3. ->with('customField')                     → Eager Load 预加载
+   → 第 2 条 SQL: SELECT FROM custom_fields WHERE id IN (?)
+
+4. ->first()                                 → 取第一条
+
+5. $value->defaultAnswer                     → getDefaultAnswerAttribute()
+   → getCustomFieldValueKey($this->type)     → 确定列名
+   → return $this->string_answer             → 返回实际值
+```
+
+**注意**：每次调用 `getCustomFieldValueBySlug()` 实际执行 2 条 SQL（1 条 morphMany+whereHas 关联查询 + 1 条 Eager Load），在 PDF 循环中仍然是严重的 N+1 问题，10 条目 × 3 字段 × 2 SQL = 60 条额外查询。
 
 ---
 
@@ -491,7 +527,7 @@ public function getCustomFieldValueBySlug($slug)
 
 | 能力 | 是否支持 | 说明 |
 |---|---|---|
-| ✅ 字段定义（CustomField） | 是 | `model_type = 'Item'` 的字段可以在设置页创建 |
+| ⚠️ 字段定义（CustomField） | **部分** | **前端 UI 无法创建**（`modelTypes` 无 Item 选项），但后端 API 无限制，可直接调用创建 |
 | ✅ 存储结构 | 是 | InvoiceItem/EstimateItem 使用 HasCustomFieldsTrait |
 | ✅ 数据库写入 | 是 | `Invoice::createItems()` 处理 `$invoiceItem['custom_fields']` |
 | ✅ 数据库读取 | 是 | `getCustomFieldValueBySlug()` 可用 |
@@ -501,6 +537,28 @@ public function getCustomFieldValueBySlug($slug)
 | ❌ 详情页显示 | 否 | 详情页无条目自定义字段展示区域 |
 | ❌ 富文本插入 | 否 | BaseCustomInput 不包含 Item 类型字段 |
 | ❌ 模板变量替换 | **部分** | 仅 Invoice 级字段，不包含 Item 级 |
+
+##### 关键核实：前端无 Item 类型创建入口
+
+在 [CustomFieldModal.vue#L232-L238](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/modal-components/custom-fields/CustomFieldModal.vue#L232-L238) 中，`modelTypes` 选项数组明确定义为：
+
+```js
+const modelTypes = reactive([
+  {label: 'Customer', value: 'Customer'},
+  {label: 'Invoice', value: 'Invoice'},
+  {label: 'Estimate', value: 'Estimate'},
+  {label: 'Expense', value: 'Expense'},
+  {label: 'Payment', value: 'Payment'}
+])
+```
+
+**确实没有 `Item` 选项**。同时后端 [CustomFieldRequest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Http/Requests/CustomFieldRequest.php#L25) 的验证规则只有 `'model_type' => 'required'`，没有 `in:Customer,Invoice,Estimate,Expense,Payment` 枚举限制。
+
+**结论**：
+- ✅ 后端存储层完整支持 `model_type = 'Item'` 的自定义字段
+- ✅ 后端 API 层允许创建（无验证限制）
+- ❌ 前端 UI 层不提供创建入口（用户无法通过界面创建）
+- 👉 只能通过直接调用 API、数据库导入或 Seeder 等方式创建 Item 类型自定义字段
 
 #### PDF 输出完整链路
 
@@ -850,6 +908,7 @@ Switch 类型在前端和后端之间需要进行 Boolean ↔ Integer 的转换�
 
 | 步骤 | 位置 | 操作 |
 |---|---|---|
+| 0 | [CustomFieldModal.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/modal-components/custom-fields/CustomFieldModal.vue#L232-L238) | 在 `modelTypes` 数组中添加 `{label: 'Item', value: 'Item'}`（**关键前提**） |
 | 1 | [invoice-item.js](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/stub/invoice-item.js) | 添加 `customFields: []` 字段 |
 | 2 | [CreateItemRow.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/estimate-invoice-common/CreateItemRow.vue) | 在商品选择下方添加 `<CreateCustomFields type="Item" :store="store" :store-prop="storeProp" :invoice-id="id" :fields="itemData.fields" />` |
 | 3 | [CreateCustomFields.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/custom-fields/CreateCustomFields.vue) | 支持将值保存到 `itemData.customFields` 而非 `store[storeProp].customFields` |
