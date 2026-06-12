@@ -883,6 +883,11 @@ Switch 类型在前端和后端之间需要进行 Boolean ↔ Integer 的转换�
 3. **无自定义字段索引**：`custom_field_values` 表缺少 `custom_field_valuable_type` + `custom_field_valuable_id` 的联合索引，大数据量下查询可能较慢
 4. **值更新策略为全量覆盖**：`updateCustomFields()` 使用 `firstOrCreate` + 逐条 save，不支持删除某个字段值（前端传空值仍会创建记录）
 5. **组件命名约定耦合**：前端动态 `import(./types/${type}Type.vue)` 要求 Vue 文件名与后端 `type` 字符串严格一致，缺少注册表或验证机制
+6. **详情页 N+1 查询问题**：详情页查询没有 eager load `fields` 和 `fields.customField`，导致 Resource 层产生多条额外查询
+7. **PDF 条目字段 N+1 性能问题**：`getCustomFieldValueBySlug()` 在循环中每次执行 2 条 SQL（morphMany+whereHas + Eager Load），PDF 生成时性能差
+8. **条目自定义字段前端双重缺失**：创建入口缺失（CustomFieldModal 的 modelTypes 无 Item）+ 输入 UI 缺失（CreateItemRow 无自定义字段渲染）
+9. **RecurringInvoice 条目级字段断裂**：`createInvoice()` 中 `$this->load('items.taxes')` 缺少 `items.fields`，导致条目自定义字段在生成 Invoice 时静默丢失
+10. **Expense 入参形态孤例**：Expense 因 FormData 提交需要 `json_decode()`，是所有模型中唯一需要手动解码 customFields 的，容易在新模型开发时遗漏
 
 ---
 
@@ -994,53 +999,174 @@ if ($request->customFields) {
 
 ---
 
-### 8.2 RecurringInvoice：单据级字段复制 vs 条目级字段断裂
+### 8.2 RecurringInvoice：三层断裂的完整链路
 
-RecurringInvoice 在生成 Invoice 时，**单据级自定义字段被完整复制**，但**条目级自定义字段完全丢失**。这是整个自定义字段系统中最大的数据链路断裂。
+RecurringInvoice 在自定义字段上存在**三层断裂**，从前端字段定义加载、到条目保存、再到生成 Invoice 时的复制，层层递进：
 
-#### 单据级字段复制链路（已接通）
+```
+第一层断裂：前端字段定义复用 Invoice 类型
+         ↓
+第二层断裂：自身条目保存时跳过 custom_fields
+         ↓
+第三层断裂：生成 Invoice 时条目字段不复制
+```
 
-[RecurringInvoice.php#L365-L376](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L365-L376) 的 `createInvoice()` 方法中，单据级自定义字段的复制逻辑如下：
+#### 第一层断裂：前端复用 Invoice 类型字段定义
+
+**现象**：循环发票的创建/编辑页面加载自定义字段时，使用的是 `type="Invoice"` 而非 `type="RecurringInvoice"`：
+
+```vue
+<!-- RecurringInvoiceCreate.vue#L106-L107 -->
+<InvoiceCustomFields
+  type="Invoice"          ← 注意：是 Invoice，不是 RecurringInvoice
+  :store="recurringInvoiceStore"
+  store-prop="newRecurringInvoice"
+  ...
+/>
+```
+
+**代码证据**：[RecurringInvoiceCreate.vue#L106-L107](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/views/recurring-invoices/create/RecurringInvoiceCreate.vue#L106-L107)
+
+**设计意图分析**：
+
+这是一个**有意的设计决策**，而非遗漏。其核心逻辑是：
+
+1. **字段定义共享**：RecurringInvoice 不单独维护一套 `model_type = 'RecurringInvoice'` 的自定义字段定义，而是复用 `model_type = 'Invoice'` 的定义
+2. **字段值独立存储**：虽然字段定义来自 Invoice 类型，但值保存在 RecurringInvoice 自身的多态关联上（`custom_field_valuable_type = 'App\Models\RecurringInvoice'`）
+3. **生成时复制**：当循环发票生成普通 Invoice 时，单据级自定义字段值被复制到新 Invoice 上（见 8.2.3 节）
+
+**数据结构示意**：
+
+```
+custom_fields 表（字段定义）
+  ┌─ id: 1, model_type: 'Invoice', name: 'PO编号', type: 'Input'
+  │
+  └─ 被两类模型共享
+        │
+        ├── Invoice 使用：custom_field_valuable_type = 'App\Models\Invoice'
+        └── RecurringInvoice 使用：custom_field_valuable_type = 'App\Models\RecurringInvoice'
+```
+
+**为什么这样设计？**
+
+- **用户体验一致性**：循环发票和普通发票在业务上是"同一种单据"的两种状态（一次性 vs 周期性），自定义字段应该保持一致
+- **减少配置成本**：用户不需要为循环发票单独配置一套字段定义
+- **生成时自然继承**：生成普通发票时，字段值可以直接复制过去，类型和定义完全匹配
+
+**验证：modelTypes 中确实没有 RecurringInvoice**
+
+[CustomFieldModal.vue#L232-L238](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/resources/scripts/admin/components/modal-components/custom-fields/CustomFieldModal.vue#L232-L238) 的 `modelTypes` 选项为：
+- Customer
+- Invoice
+- Estimate
+- Expense
+- Payment
+
+**确实没有 RecurringInvoice**，这从侧面印证了"复用 Invoice 类型"是有意的设计。
+
+#### 第二层断裂：自身条目保存时跳过 custom_fields
+
+**现象**：RecurringInvoice 保存自身的条目时，`createItems()` 方法完全跳过了 `custom_fields` 处理，只有 `taxes` 被正确保存。
+
+**代码对比**：
+
+| 模型 | createItems 方法 | 是否处理 custom_fields |
+|---|---|---|
+| **Invoice** | [Invoice::createItems()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/Invoice.php#L500-L538) | ✅ 有，第535-537行 |
+| **RecurringInvoice** | [RecurringInvoice::createItems()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L246-L260) | ❌ 无 |
+
+**代码细节**：
 
 ```php
-if ($this->fields()->exists()) {
-    $customField = [];
+// Invoice::createItems() — 有 custom_fields 处理
+public static function createItems($invoice, $invoiceItems)
+{
+    foreach ($invoiceItems as $invoiceItem) {
+        $item = $invoice->items()->create($invoiceItem);
 
-    foreach ($this->fields as $data) {
-        $customField[] = [
-            'id' => $data->custom_field_id,
-            'value' => $data->defaultAnswer,
-        ];
+        if (array_key_exists('taxes', $invoiceItem) && $invoiceItem['taxes']) {
+            // ... 保存税费
+        }
+
+        // ✅ 有 custom_fields 处理
+        if (array_key_exists('custom_fields', $invoiceItem) && $invoiceItem['custom_fields']) {
+            $item->addCustomFields($invoiceItem['custom_fields']);
+        }
     }
-
-    $invoice->addCustomFields($customField);
 }
 ```
 
-**复制策略**：
+```php
+// RecurringInvoice::createItems() — 只有 taxes，没有 custom_fields
+public static function createItems($recurringInvoice, $invoiceItems)
+{
+    foreach ($invoiceItems as $invoiceItem) {
+        $invoiceItem['company_id'] = $recurringInvoice->company_id;
+        $item = $recurringInvoice->items()->create($invoiceItem);
 
-1. 检查 RecurringInvoice 是否有自定义字段值
-2. 遍历每个值，构造 `['id' => 字段定义ID, 'value' => 实际值]` 数组
-3. 调用 `addCustomFields()` 将值写入新 Invoice
+        if (array_key_exists('taxes', $invoiceItem) && $invoiceItem['taxes']) {
+            // ... 保存税费
+        }
+        // ❌ 缺少 custom_fields 的处理！
+    }
+}
+```
 
-**这个策略正确地绕过了多态关联的 owner 切换**：不是直接复制 `custom_field_values` 记录（那样会导致多态类型指向 RecurringInvoice），而是重新构造入参数组，让 `addCustomFields()` 以 Invoice 为 owner 创建新的值记录。
+**断裂原因分析**：
 
-#### 条目级字段断裂点（未接通）
+这很可能是一个**实现遗漏**，而非设计决策。理由：
+1. 条目的多态关联存储能力是完整的（`InvoiceItem` 使用了 `HasCustomFieldsTrait`）
+2. Invoice 版本的 `createItems()` 有完整实现，RecurringInvoice 版本只是一个简化的复刻
+3. 税费（taxes）被正确复制了，说明开发时关注了 taxes 但漏掉了 custom_fields
+4. 结合第三层断裂（生成 Invoice 时也不复制条目字段），更像是两处独立的遗漏
 
-[RecurringInvoice.php#L358-L359](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L358-L359) 中，条目的复制逻辑如下：
+**注意**：即使补上这一层，由于前端 CreateItemRow 没有条目自定义字段的输入 UI（见第九章），用户仍然无法通过界面填写条目自定义字段。但 API 层面的打通是前提。
+
+#### 第三层断裂：生成 Invoice 时条目字段不复制
+
+这一层是上一节详细分析过的断裂，此处简要回顾：
+
+[RecurringInvoice.php#L358-L359](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L358-L359) 中：
 
 ```php
-$this->load('items.taxes');
+$this->load('items.taxes');                    ← 只加载了 taxes
 Invoice::createItems($invoice, $this->items->toArray());
 ```
 
-**断裂点分析**：
+由于 `$this->load('items.taxes')` 缺少 `items.fields`，`toArray()` 不包含 `custom_fields` 键，导致 `Invoice::createItems()` 中的 `array_key_exists('custom_fields', $invoiceItem)` 返回 `false`，条目级自定义字段被跳过。
 
-1. **Eager Load 缺失**：`$this->load('items.taxes')` 只加载了 `items.taxes` 关系，**没有加载 `items.fields`**，导致 `$this->items->toArray()` 中不包含 `custom_fields` 数据
+#### 三层断裂的因果关系
 
-2. **toArray() 不会包含未加载的关联**：Eloquent 的 `toArray()` 只序列化已加载的关联。由于 `items.fields` 没有被 eager load，序列化结果中不会有 `custom_fields` 键
+```
+第一层（前端定义复用）
+   原因：设计决策（有意为之）
+   影响：RecurringInvoice 没有自己的字段定义，与 Invoice 共享
+   状态：✅ 合理设计
 
-3. **Invoice::createItems() 的守门条件**：[Invoice.php#L535-L537](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/Invoice.php#L535-L537) 中有明确的判断：
+第二层（自身条目保存）
+   原因：实现遗漏（与 Invoice::createItems 对比可知）
+   影响：即使通过 API 传入条目自定义字段，也不会被保存
+   状态：❌ Bug
+
+第三层（生成时条目复制）
+   原因：实现遗漏（eager load 缺失）
+   影响：生成的 Invoice 条目上没有自定义字段值
+   状态：❌ Bug
+```
+
+**修复优先级**：
+
+1. **第三层断裂**（生成时复制）：影响最大，直接关系到循环发票的核心功能
+2. **第二层断裂**（自身保存）：是第三层断裂的前提，如果自身都存不下来，复制就无从谈起
+3. **第一层设计**：无需修改，复用 Invoice 类型定义是合理的设计
+
+#### 完整修复方案
+
+修复条目级自定义字段在 RecurringInvoice 上的完整链路，需要修改两处：
+
+**修复 1：RecurringInvoice::createItems() 增加 custom_fields 处理**
+
+在 [RecurringInvoice.php#L246-L260](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L246-L260) 的 `createItems()` 方法中，参照 `Invoice::createItems()` 添加：
 
 ```php
 if (array_key_exists('custom_fields', $invoiceItem) && $invoiceItem['custom_fields']) {
@@ -1048,44 +1174,9 @@ if (array_key_exists('custom_fields', $invoiceItem) && $invoiceItem['custom_fiel
 }
 ```
 
-由于 `toArray()` 不包含 `custom_fields` 键，`array_key_exists('custom_fields', $invoiceItem)` 返回 `false`，条目级自定义字段被完全跳过。
+**修复 2：createInvoice() 中 eager load items.fields 并重组数据**
 
-#### 断裂链路可视化
-
-```
-RecurringInvoice.createInvoice()
-  │
-  ├── ✅ 单据级字段复制（已接通）
-  │   $this->fields()->exists()
-  │   foreach ($this->fields as $data) { ... }
-  │   $invoice->addCustomFields($customField)
-  │
-  ├── ❌ 条目级字段复制（断裂点 1：eager load 缺失）
-  │   $this->load('items.taxes')          ← 没有 'items.fields'
-  │   Invoice::createItems($invoice, $this->items->toArray())
-  │     │
-  │     └── ❌ 条目级字段写入（断裂点 2：toArray 不含 custom_fields）
-  │         array_key_exists('custom_fields', $invoiceItem)  ← false
-  │         → 条目字段被跳过
-  │
-  └── ✅ 税费复制
-      $this->taxes()->exists()
-      Invoice::createTaxes($invoice, $this->taxes->toArray())
-```
-
-#### 修复方案
-
-只需修改 [RecurringInvoice.php#L358](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L358) 一行代码：
-
-```php
-// 修复前：
-$this->load('items.taxes');
-
-// 修复后：
-$this->load('items.taxes', 'items.fields', 'items.fields.customField');
-```
-
-然后在 `$this->items->toArray()` 之前，需要手动将 `fields` 重组为 `custom_fields` 格式（因为 `toArray()` 序列化 `fields` 关系时的键名是 `fields` 而非 `custom_fields`，而 `Invoice::createItems()` 检查的键名是 `custom_fields`）：
+在 [RecurringInvoice.php#L358](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L358) 将 `$this->load('items.taxes')` 改为：
 
 ```php
 $this->load('items.taxes', 'items.fields', 'items.fields.customField');
@@ -1106,11 +1197,22 @@ $itemsData = $this->items->map(function ($item) {
 Invoice::createItems($invoice, $itemsData);
 ```
 
-#### 影响范围
+#### 单据级字段：已接通的完整链路
 
-- **当前行为**：如果用户在 RecurringInvoice 的条目上通过 API 填充了自定义字段值，这些值在生成的 Invoice 中会**静默丢失**，不会有任何错误提示
-- **数据完整性**：已生成的 Invoice 条目上不会有对应的 `custom_field_values` 记录，PDF 输出中条目自定义字段列会显示为空
-- **用户感知**：由于前端无法为条目填写自定义字段（见第八章），当前这个断裂在正常使用流程中不可见，仅在使用 API 直接填充时才会暴露
+与条目级字段的三层断裂形成鲜明对比的是，**单据级自定义字段在 RecurringInvoice 上是完整接通的**：
+
+1. **定义层**：复用 `model_type = 'Invoice'` 的字段定义（前端 `type="Invoice"`）
+2. **保存层**：[RecurringInvoice::createFromRequest()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L212-L214) 调用 `addCustomFields()` 保存到 RecurringInvoice 自身
+3. **复制层**：[RecurringInvoice::createInvoice()](file:///d:/fz/0601-1/solo-dogfeeding/code/23-InvoiceShelf/app/Models/RecurringInvoice.php#L365-L376) 遍历字段值并重新构造，调用 `$invoice->addCustomFields()` 写入新生成的 Invoice
+
+**单据级复制策略的精妙之处**：
+
+不是直接复制 `custom_field_values` 记录（那样多态类型会错），而是：
+1. 遍历 RecurringInvoice 的 `fields` 关系
+2. 重新构造 `['id' => custom_field_id, 'value' => defaultAnswer]` 格式
+3. 调用 `$invoice->addCustomFields($customField)` 创建新记录
+
+这样保证了新 Invoice 上的值记录拥有正确的 `custom_field_valuable_type = 'App\Models\Invoice'`。
 
 ---
 
