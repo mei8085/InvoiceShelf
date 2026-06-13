@@ -1070,21 +1070,376 @@ PDF 路由不依赖 header 的根本原因：
 
 ---
 
-## 九、关键文件索引
+## 九、公司隔离的四个易被忽视的代码级问题
+
+公司隔离机制表面上通过 `whereCompany()` 和 `CompanyMiddleware` 实现了数据隔离，但在四个细节上存在容易被触发但难以排查的问题。本节逐一分析其触发条件、SQL 形式、隐蔽性及影响。
+
+---
+
+### 9.1 问题一：按 id 过滤分类时 `orWhere` 破坏公司隔离
+
+#### 代码位置
+
+[ExpenseCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/ExpenseCategory.php#L51-L54)
+
+```php
+public function scopeWhereCategory($query, $category_id)
+{
+    $query->orWhere('id', $category_id);  // ⚠️  用了 orWhere，前面没有 where 条件
+}
+```
+
+该 scope 被 [ExpenseCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/ExpenseCategory.php#L61-L76) 的 `scopeApplyFilters()` 在 `category_id` 参数存在时调用：
+
+```php
+public function scopeApplyFilters($query, array $filters)
+{
+    $filters = collect($filters);
+
+    if ($filters->get('category_id')) {
+        $query->whereCategory($filters->get('category_id'));  // 触发 orWhere
+    }
+    // ...
+}
+```
+
+#### 典型调用链（分类列表接口）
+
+```php
+// ExpenseCategoriesController::index()
+$categories = ExpenseCategory::applyFilters($request->all())  // 先调 applyFilters
+    ->whereCompany()                                           // 后调 whereCompany
+    ->latest()
+    ->paginateData($limit);
+```
+
+#### 生成的 SQL
+
+请求：`GET /api/v1/categories?category_id=7`
+
+当前公司 header：`company: 1`
+
+```sql
+SELECT *
+FROM expense_categories
+WHERE id = 7                  -- orWhere 展开后变成独立条件
+   OR company_id = 1          -- 原本的公司隔离条件
+ORDER BY created_at DESC
+LIMIT 5 OFFSET 0
+```
+
+**致命问题**：`OR company_id = 1` 意味着 **id=7 的分类，即使不属于公司 1，也会被返回**。
+
+#### 更广泛的影响：多个 Model 存在同一模式
+
+`orWhere('id', xxx)` 不是孤立问题，整个项目至少有 **8 个 Model** 复制了同样的错误模式：
+
+| Model | 代码位置 | 问题 scope |
+|-------|---------|-----------|
+| ExpenseCategory | `ExpenseCategory.php#L53` | `scopeWhereCategory` |
+| Expense | `Expense.php#L188` | `scopeWhereExpense` |
+| Item | `Item.php#L71` | `scopeWhereItem` |
+| Payment | `Payment.php#L364` | `scopeWherePayment` |
+| PaymentMethod | `PaymentMethod.php#L62` | `scopeWherePaymentMethod` |
+| TaxType | `TaxType.php#L48` | `scopeWhereTaxType` |
+| Unit | `Unit.php#L33` | `scopeWhereUnit` |
+| Customer | `Customer.php#L293` | `scopeWhereCustomer` |
+| Invoice | `Invoice.php#L299` | `scopeWhereInvoice` |
+| Estimate | `Estimate.php#L144` | `scopeWhereEstimate` |
+
+每一个的实现形式完全相同：
+
+```php
+public function scopeWhereXxx($query, $xxx_id)
+{
+    $query->orWhere('id', $xxx_id);  // 同样的 orWhere 问题
+}
+```
+
+#### 触发条件
+
+只要满足：
+1. 前端请求中携带 `?category_id=xxx`（或对应 Model 的 `?xxx_id=xxx`）
+2. 调用顺序为 `applyFilters()` → `whereCompany()`（先过滤后加公司隔离）
+
+#### 为何平时不易发现
+
+- 分类列表页的正常调用通常不传 `category_id` 参数，只传 `search`、`page`、`limit`
+- 只有当通过 API 直接构造带 `category_id` 的请求时才会触发
+- 返回结果中混入一条其他公司的数据，在 UI 上可能只是"多了一条"，不易立刻察觉
+- 触发条件依赖"先 applyFilters 后 whereCompany"的调用顺序，若换过来则不触发
+
+#### 对分类结果的影响
+
+- **横向越权**：公司 A 的用户传入公司 B 的某个分类 ID，可以读取到该分类的 `id`、`name`、`description` 等全部字段
+- **隔离失效**：公司隔离条件被 `OR` 运算符弱化，不再是硬约束
+- **影响面广**：同样问题波及支出、产品、回款、客户、发票等几乎所有核心实体
+
+---
+
+### 9.2 问题二：`applyFilters` 中 `company_id` 被静默丢弃
+
+#### 代码位置
+
+[ExpenseCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/ExpenseCategory.php#L69-L71)
+
+```php
+public function scopeApplyFilters($query, array $filters)
+{
+    $filters = collect($filters);
+
+    // ...
+
+    if ($filters->get('company_id')) {
+        $query->whereCompany($filters->get('company_id'));  // ⚠️  传了参数但被忽略
+    }
+
+    // ...
+}
+```
+
+看 `scopeWhereCompany` 的定义（[ExpenseCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/ExpenseCategory.php#L46-L49)）：
+
+```php
+public function scopeWhereCompany($query)
+{
+    $query->where('company_id', request()->header('company'));  // ⚠️  不接收参数，直接读 header
+}
+```
+
+调用方传入的 `$filters->get('company_id')` 被 `whereCompany()` **完全忽略**。
+
+#### 生成的 SQL
+
+请求：`GET /api/v1/categories?company_id=999`（企图绕过 header 查公司 999）
+
+当前 header：`company: 1`
+
+```sql
+SELECT *
+FROM expense_categories
+WHERE company_id = 1       -- 用的是 header 的值，不是 999
+ORDER BY created_at DESC
+LIMIT 5 OFFSET 0
+```
+
+#### 触发条件
+
+只要请求中携带 `company_id` 查询参数，就会触发这个被静默丢弃的分支。
+
+#### 为何平时不易发现
+
+- 正常前端代码不会在查询参数里传 `company_id`，都是通过 header 传
+- 攻击者即使发现这个参数并尝试传值，也不会得到预期结果（因为实际还是用 header），所以这个分支是"看似有效、实则无效"的死代码
+- 不会报错，不会在日志中留下任何痕迹，难以通过常规手段发现
+
+#### 对分类结果的影响
+
+- **无害但具有迷惑性**：看似可以通过 `?company_id=` 来指定公司，实际仍由 header 决定
+- **代码腐烂**：无效分支不仅误导后续维护者，还可能让真正需要按公司过滤的场景被错误实现
+- **不一致性**：同样叫 `whereCompany()`，`Expense::scopeWhereCompanyId($company)` 是接收参数的，而 `ExpenseCategory::scopeWhereCompany()` 是不接收参数的，两套 API 风格不一致
+
+---
+
+### 9.3 问题三：仪表盘 12 个月计算触发大量重复 SQL
+
+#### 代码位置
+
+[DashboardController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Http/Controllers/V1/Admin/Dashboard/DashboardController.php#L62-L100)
+
+```php
+while ($monthCounter < 12) {
+    array_push(
+        $invoice_totals,
+        Invoice::whereBetween('invoice_date', [$start, $end])
+            ->whereCompany()
+            ->sum('base_total')
+    );
+
+    array_push(
+        $expense_totals,
+        Expense::whereBetween('expense_date', [$start, $end])
+            ->whereCompany()
+            ->sum('base_amount')
+    );
+
+    array_push(
+        $receipt_totals,
+        Payment::whereBetween('payment_date', [$start, $end])
+            ->whereCompany()
+            ->sum('base_amount')
+    );
+
+    array_push($net_income_totals, ($receipt_totals[$i] - $expense_totals[$i]));
+
+    // ... 移动日期窗口
+    $monthCounter++;
+}
+```
+
+循环结束后还有 4 次年度总计查询：
+
+```php
+$total_sales    = Invoice::whereBetween(...)->whereCompany()->sum('base_total');
+$total_receipts = Payment::whereBetween(...)->whereCompany()->sum('base_amount');
+$total_expenses = Expense::whereBetween(...)->whereCompany()->sum('base_amount');
+$total_net_income = $total_receipts - $total_expenses;
+```
+
+#### SQL 调用形式
+
+**单次循环执行 3 条聚合查询**：
+
+```sql
+-- 第1个月
+SELECT SUM(base_total)  FROM invoices WHERE invoice_date BETWEEN ? AND ? AND company_id = ?;
+SELECT SUM(base_amount) FROM expenses WHERE expense_date BETWEEN ? AND ? AND company_id = ?;
+SELECT SUM(base_amount) FROM payments  WHERE payment_date  BETWEEN ? AND ? AND company_id = ?;
+
+-- 第2个月
+SELECT SUM(base_total)  FROM invoices WHERE invoice_date BETWEEN ? AND ? AND company_id = ?;
+SELECT SUM(base_amount) FROM expenses WHERE expense_date BETWEEN ? AND ? AND company_id = ?;
+SELECT SUM(base_amount) FROM payments  WHERE payment_date  BETWEEN ? AND ? AND company_id = ?;
+
+... 重复 12 次 ...
+
+-- 年度总计（4次）
+SELECT SUM(base_total)  FROM invoices WHERE invoice_date BETWEEN ? AND ? AND company_id = ?;
+SELECT SUM(base_amount) FROM expenses WHERE expense_date BETWEEN ? AND ? AND company_id = ?;
+SELECT SUM(base_amount) FROM payments  WHERE payment_date  BETWEEN ? AND ? AND company_id = ?;
+```
+
+**总查询次数**：12 月 × 3 表 + 4 次年度总计 = **40 次 SQL 查询**（每次 Dashboard 加载）。
+
+更严重的是 `net_income_totals` 是用 PHP 计算的（`$receipt_totals[$i] - $expense_totals[$i]`），本身不需要数据库查询，但为了获得分子分母多执行了 24 次查询。
+
+#### 触发条件
+
+每次用户打开仪表盘页面，或前端 store 调用 `loadData()` 时触发。
+
+#### 为何平时不易发现
+
+- 开发环境数据量小（每个表几千条以内），40 次查询总耗时通常在 100-300ms，感知不明显
+- 每个 `SUM()` 查询都走索引（`expense_date`、`invoice_date` 等字段通常有索引），单条查询很快
+- 没有 N+1 明显的错误模式（如循环内查询关联模型），常规性能分析工具不容易标记为"慢查询"
+- 只有当数据量增长到每个表几十万条、或并发用户多时，响应时间才会明显劣化
+
+#### 对分类结果（及整体性能）的影响
+
+- **响应时间线性增长**：每增加一个月的数据量，3 个 `SUM()` 的耗时都会增长
+- **数据库压力**：40 次查询 / 次访问，10 个并发用户就是 400 次并发查询
+- **本可优化**：理论上只需 3 条查询（按 `GROUP BY MONTH(expense_date)` 聚合一次，取出 12 个月数据），即可代替 36 次月度 `SUM()` 查询
+- **分类层面的间接影响**：虽然问题三不直接影响分类结果，但仪表盘是用户高频访问页面，其性能问题会拖慢整个系统，间接导致分类列表等其他接口响应变慢
+
+---
+
+### 9.4 问题四：`CompanyMiddleware` 在无公司信息时触发空指针
+
+#### 代码位置
+
+[CompanyMiddleware.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Http/Middleware/CompanyMiddleware.php#L17-L28)
+
+```php
+public function handle(Request $request, Closure $next): Response
+{
+    if (Schema::hasTable('user_company')) {
+        $user = $request->user();
+
+        if ((! $request->header('company')) || (! $user->hasCompany($request->header('company')))) {
+            // ⚠️  两处潜在空指针
+            $request->headers->set('company', $user->companies()->first()->id);
+        }
+    }
+
+    return $next($request);
+}
+```
+
+#### 空指针触发点 1：`$user` 为 null
+
+第 22 行 `$user->hasCompany(...)` 和第 23 行 `$user->companies()` 都假设 `$user` 非空。
+
+但是 `$request->user()` 在以下情况会返回 `null`：
+- Sanctum token 已过期但请求仍命中了 `auth:sanctum` 中间件组
+- token 被撤销
+- 测试环境中未正确设置用户上下文
+
+此时调用 `$user->hasCompany()` 会抛出：
+```
+Error: Call to a member function hasCompany() on null
+```
+
+#### 空指针触发点 2：`$user->companies()->first()` 返回 null
+
+第 23 行 `$user->companies()->first()->id` 假设 `first()` 一定有结果。
+
+但 `companies()` 是多对多关联（[User.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/User.php#L127-L130)）：
+
+```php
+public function companies(): BelongsToMany
+{
+    return $this->belongsToMany(Company::class, 'user_company', 'user_id', 'company_id');
+}
+```
+
+如果 `user_company` 表中没有该用户的任何关联记录（新创建的用户还未分配公司，或所有关联被意外删除），`first()` 返回 `null`，调用 `->id` 会抛出：
+
+```
+Error: Attempt to read property "id" on null
+```
+
+#### 触发条件
+
+| 场景 | 触发概率 | 现象 |
+|------|---------|------|
+| 用户账号刚创建，尚未分配任何公司 | 中 | 新员工首次登录时报 500 错误 |
+| 通过后台删除了 `user_company` 中某用户的最后一条关联 | 低 | 该用户所有 API 请求全部 500 |
+| Sanctum token 过期或被撤销 | 中（生产环境偶发） | 前端收到 500 而非正常的 401 |
+| 单元测试/集成测试未设置用户上下文 | 高（开发期） | 测试 CI 报红 |
+
+#### 为何平时不易发现
+
+- 正常业务流程中，创建用户的同时会在 `user_company` 表插入关联记录，99.9% 的用户至少属于一个公司
+- token 过期时 Sanctum 本身的 `auth:sanctum` 中间件通常先抛出 401，请求还没到 `company` 中间件
+- 只有当 token 有效但用户权限刚好被清空、或者用户数据库被手工改动时才触发
+- 问题属于"尾部场景"，在正常使用路径上难以覆盖
+
+#### 对分类结果的影响
+
+- **完全阻断**：一旦触发空指针，整个请求链提前终止于 500 错误，分类接口不会返回任何数据
+- **用户体验差**：没有优雅降级（如跳转到"无公司权限"提示页），直接展示通用错误页
+- **故障排查难**：日志中只显示 `Error: Call to a member function hasCompany() on null`，运维人员需要一定时间才能定位到是中间件的问题
+- **同样问题波及其他文件**：[User.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/User.php#L94-L96) 的 `getFormattedCreatedAtAttribute()` 中也有同样的 `$this->companies()->first()->id` 模式，同样面临空指针风险
+
+---
+
+### 9.5 四个问题对比汇总
+
+| 问题 | 严重程度 | 触发概率 | 隐蔽性 | 直接影响 |
+|------|---------|---------|-------|---------|
+| 1. orWhere 破坏隔离 | ⚠️ 高 | 中 | 高 | 横向越权，跨公司读取分类 |
+| 2. company_id 被丢弃 | ⚠️ 中 | 低 | 极高 | 死代码，误导开发者 |
+| 3. 仪表盘重复 SQL | ⚠️ 中 | 极高（每次访问） | 中 | 性能随数据量线性劣化 |
+| 4. 中间件空指针 | ⚠️ 高 | 低 | 低 | 500 错误阻断整个请求 |
+
+---
+
+## 十、关键文件索引
 
 | 角色 | 文件路径 |
 |------|---------|
 | 支出模型（含所有 scope） | `app/Models/Expense.php` |
-| 分类模型（含 amount 访问器） | `app/Models/ExpenseCategory.php` |
-| 公司中间件 | `app/Http/Middleware/CompanyMiddleware.php` |
+| 分类模型（含 amount 访问器、orWhere 问题） | `app/Models/ExpenseCategory.php` |
+| 公司中间件（含空指针问题） | `app/Http/Middleware/CompanyMiddleware.php` |
 | 支出请求（含 base_amount 计算） | `app/Http/Requests/ExpenseRequest.php` |
 | 分类创建请求（无唯一约束） | `app/Http/Requests/ExpenseCategoryRequest.php` |
 | 分类列表控制器 | `app/Http/Controllers/V1/Admin/Expense/ExpenseCategoriesController.php` |
-| 仪表盘控制器 | `app/Http/Controllers/V1/Admin/Dashboard/DashboardController.php` |
+| 仪表盘控制器（含循环查询问题） | `app/Http/Controllers/V1/Admin/Dashboard/DashboardController.php` |
 | 支出报表控制器 | `app/Http/Controllers/V1/Admin/Report/ExpensesReportController.php` |
 | 损益报表控制器 | `app/Http/Controllers/V1/Admin/Report/ProfitLossReportController.php` |
 | 报表授权策略 | `app/Policies/ReportPolicy.php` |
 | 分类 Resource | `app/Http/Resources/ExpenseCategoryResource.php` |
+| 用户模型（含 companies() 关联） | `app/Models/User.php` |
 | 分类前端 Store | `resources/scripts/admin/stores/category.js` |
 | 仪表盘前端 Store | `resources/scripts/admin/stores/dashboard.js` |
 | 分类管理页视图 | `resources/scripts/admin/views/settings/ExpenseCategorySetting.vue` |
