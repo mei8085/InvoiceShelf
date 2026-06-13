@@ -743,7 +743,334 @@ GET /api/v1/categories
 
 ---
 
-## 七、关键文件索引
+## 七、分类金额语境辨析：三个容易混淆的"分类列表"
+
+用户口中的"分类列表"在代码中实际对应三个不同层次的概念，它们对 `amount` 字段的消费情况、承担的业务角色完全不同。本节把三者边界划清。
+
+### 7.1 概念区分总览
+
+| 概念 | 定义位置 | 业务角色 | 是否消费 amount |
+|------|---------|---------|---------------|
+| **分类接口返回值** | `GET /api/v1/categories` 的 HTTP 响应 JSON | 通用数据源，供多个前端页面消费 | ✅ Resource 始终序列化 amount |
+| **分类管理页** | `ExpenseCategorySetting.vue` | 管理员维护分类字典（增删改） | ❌ 页面不渲染 amount 列 |
+| **分类列表（本文语境）** | 分析文章中的术语，泛指分类维度的聚合结果 | 支撑报表与金额统计 | 视情况而定 |
+
+---
+
+### 7.2 分类接口返回值（通用数据源）
+
+**路由**：[api.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/routes/api.php#L320)
+
+```php
+Route::apiResource('categories', ExpenseCategoriesController::class);
+```
+
+**控制器**：[ExpenseCategoriesController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Http/Controllers/V1/Admin/Expense/ExpenseCategoriesController.php#L20-L32)
+
+```php
+public function index(Request $request)
+{
+    $this->authorize('viewAny', ExpenseCategory::class);
+
+    $limit = $request->has('limit') ? $request->limit : 5;
+
+    $categories = ExpenseCategory::applyFilters($request->all())
+        ->whereCompany()
+        ->latest()
+        ->paginateData($limit);
+
+    return ExpenseCategoryResource::collection($categories);
+}
+```
+
+**Resource**：[ExpenseCategoryResource.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Http/Resources/ExpenseCategoryResource.php#L15-L28)
+
+```php
+public function toArray($request): array
+{
+    return [
+        'id' => $this->id,
+        'name' => $this->name,
+        'description' => $this->description,
+        'company_id' => $this->company_id,
+        'amount' => $this->amount,           // ← 始终返回
+        'formatted_created_at' => $this->formattedCreatedAt,
+    ];
+}
+```
+
+**结论**：接口响应体中 `amount` 字段是**无条件存在**的，无论调用方是否需要。这是导致"分类管理页没用 amount 但后端仍在算"的直接原因。
+
+---
+
+### 7.3 分类接口的三个实际消费者
+
+分类接口并非只被分类管理页调用，实际上有三个前端页面通过 [category.js](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/stores/category.js) 的 `fetchCategories()` 访问它：
+
+```js
+// category.js#L26-L38
+fetchCategories(params) {
+  return new Promise((resolve, reject) => {
+    http.get(`/api/v1/categories`, { params })
+      .then((response) => {
+        this.categories = response.data.data   // 把整段响应塞到 store
+        resolve(response)
+      })
+  })
+}
+```
+
+#### 消费者 1：分类管理页（设置页）
+
+[ExpenseCategorySetting.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/views/settings/ExpenseCategorySetting.vue#L86-L103)
+
+```js
+async function fetchData({ page, filter, sort }) {
+  let data = { orderByField: sort.fieldName || 'created_at', orderBy: sort.order || 'desc', page }
+  let response = await categoryStore.fetchCategories(data)
+  return {
+    data: response.data.data,          // 数据给 BaseTable
+    pagination: { totalPages: response.data.meta.last_page, ... }
+  }
+}
+```
+
+表格列定义（见 [ExpenseCategorySetting.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/views/settings/ExpenseCategorySetting.vue#L62-L84)）**只有 name、description、actions 三列**，`amount` 字段随响应体返回但被静默丢弃。
+
+#### 消费者 2：支出创建/编辑页（下拉选择器）
+
+[Create.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/views/expenses/Create.vue#L73-L88)
+
+```html
+<BaseMultiselect
+  v-model="expenseStore.currentExpense.expense_category_id"
+  value-prop="id"
+  label="name"     <!-- 下拉只显示 name -->
+  track-by="id"
+  :options="searchCategory"
+  ...
+/>
+```
+
+[Create.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/views/expenses/Create.vue#L436-L446) 的 `searchCategory()` 把搜索结果作为下拉候选项，**只使用 `id` 和 `name`**。
+
+#### 消费者 3：支出列表页（筛选下拉）
+
+[Index.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/views/expenses/Index.vue#L53-L66)
+
+```html
+<BaseMultiselect
+  v-model="filters.expense_category_id"
+  value-prop="id"
+  label="name"    <!-- 筛选器只显示 name -->
+  track-by="name"
+  :options="searchCategory"
+  ...
+/>
+```
+
+[Index.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/resources/scripts/admin/views/expenses/Index.vue#L328-L335) 在页面挂载时拉全部分类用于筛选下拉，**也只消费 `id` 和 `name`**。
+
+---
+
+### 7.4 三者关系与 amount 的尴尬位置
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│           GET /api/v1/categories （接口返回值）               │
+│  { id, name, description, company_id, amount, formatted_... } │
+│                      ↑ amount 无条件存在                       │
+└──────────────┬─────────────────────────────┬─────────────────┘
+               │                             │
+               ▼                             ▼
+  ┌─────────────────────────┐    ┌────────────────────────────┐
+  │  分类管理页（设置页）     │    │  支出创建页 / 支出列表页     │
+  │  渲染列：name/desc/操作  │    │  仅做下拉选择，读 id+name   │
+  │  ❌ 完全不展示 amount    │    │  ❌ 也不展示 amount         │
+  └─────────────────────────┘    └────────────────────────────┘
+```
+
+**`amount` 字段在整条链路中的处境**：
+- Resource 层不管谁调用，一律序列化 `$this->amount`
+- 这触发了 `ExpenseCategory::getAmountAttribute()` 访问器执行 `SELECT SUM(amount) FROM expenses WHERE expense_category_id = ?`
+- 但前端三个消费者没有一个页面真正渲染或读取 `amount`
+- 每分页返回 5 条分类就多执行 5 次 SQL，属于**典型的过度计算**
+
+> 如果将来某页面确实需要展示分类金额，也应当把 `base_amount` 作为统一口径（参见 2.3 节和第五节），而非当前访问器中的 `sum('amount')`。
+
+---
+
+## 八、公司请求参数为何不真正参与分类结果裁决
+
+"请求里带的 `company` 参数"这个说法容易让人以为是查询参数（如 `?company=5`）。实际代码中它是 **HTTP Header**（`company`），并且经历了"中间件校正 → scope 只读校正后的值"两层过滤，用户传入的原始值并不直接决定结果。本节把链路讲透。
+
+### 8.1 请求参数进入系统的入口与路径
+
+#### 参数形态
+
+前端并不是发 `?company=5`，而是在 HTTP 请求头中携带：
+
+```
+GET /api/v1/categories
+Headers:
+  Authorization: Bearer <token>
+  company: 5          ← 当前选中的公司 ID
+  Accept: application/json
+```
+
+#### 中间件的挂载位置
+
+[bootstrap/app.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/bootstrap/app.php#L70-L84) 先把中间件别名注册好：
+
+```php
+$middleware->alias([
+    'auth' => Authenticate::class,
+    'company' => CompanyMiddleware::class,   // ← 别名叫 company
+    'bouncer' => ScopeBouncer::class,
+    // ...
+]);
+```
+
+[api.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/routes/api.php#L191-L192) 的路由组按顺序嵌套：
+
+```php
+Route::middleware(['auth:sanctum', 'company'])->group(function () {
+    Route::middleware(['bouncer'])->group(function () {
+        // ... 所有 API，包括 /categories、/dashboard
+    });
+});
+```
+
+**执行顺序**：`auth:sanctum` 先验证登录态 → `company` 中间件再校正公司 → `bouncer` → 进入控制器。
+
+---
+
+### 8.2 CompanyMiddleware 的校正逻辑
+
+[CompanyMiddleware.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Http/Middleware/CompanyMiddleware.php#L17-L28) 是整个链路的关键裁决点：
+
+```php
+public function handle(Request $request, Closure $next): Response
+{
+    if (Schema::hasTable('user_company')) {
+        $user = $request->user();
+
+        if ((! $request->header('company')) || (! $user->hasCompany($request->header('company')))) {
+            $request->headers->set('company', $user->companies()->first()->id);
+        }
+    }
+
+    return $next($request);
+}
+```
+
+把这段逻辑拆成真值表：
+
+| `header('company')` 存在吗？ | 用户 `hasCompany(header 值)` 吗？ | 中间件动作 | 最终 header 值 |
+|---------------------------|-------------------------------|----------|-------------|
+| ✅ 存在 | ✅ 有权 | 什么都不做，原样放行 | ✅ 用户传的值生效 |
+| ✅ 存在 | ❌ 无权（越权传他人公司 ID） | 覆盖为 `companies()->first()` | ❌ 用户传的值被丢弃 |
+| ❌ 不存在 | — | 覆盖为 `companies()->first()` | ❌ 回退到默认公司 |
+
+**这就是"请求参数不真正参与裁决"的根源**：用户传的 header 值先被当作"建议值"，只有通过了 `$user->hasCompany()` 权限校验才被采纳，否则被静默替换。
+
+---
+
+### 8.3 控制器与 scope 只读"校正后"的值
+
+分类接口 [ExpenseCategoriesController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Http/Controllers/V1/Admin/Expense/ExpenseCategoriesController.php#L20-L32)：
+
+```php
+public function index(Request $request)
+{
+    $categories = ExpenseCategory::applyFilters($request->all())
+        ->whereCompany()    // ← 调 scope
+        ->latest()
+        ->paginateData($limit);
+}
+```
+
+`whereCompany()` scope 定义在 [ExpenseCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/app/Models/ExpenseCategory.php#L46-L49)：
+
+```php
+public function scopeWhereCompany($query)
+{
+    $query->where('company_id', request()->header('company'));
+    //                              ↑ 读的是 request 对象上"已被中间件改过"的 header
+}
+```
+
+这里的 `request()->header('company')` 不是前端原始传进来的值，而是**经过 CompanyMiddleware 校正后的最终值**。
+
+---
+
+### 8.4 一条请求的完整决策链路
+
+```
+前端发起请求
+  │
+  │  Headers: company=5  （用户"想"看公司 5）
+  ▼
+auth:sanctum 中间件
+  │
+  │  验证 Bearer token，取出当前用户（假设用户 ID=42，属于公司 1 和 2）
+  ▼
+company 中间件 (CompanyMiddleware)
+  │
+  │  1. $request->header('company') → "5"
+  │  2. $user->hasCompany(5)        → false （用户只属于 1、2）
+  │  3. $request->headers->set('company', $user->companies()->first()->id)
+  │                                    覆盖为 1（用户的第一个公司）
+  │
+  │  ⚠️  到这里，header('company') 的值已经从 "5" 变成 "1"
+  ▼
+bouncer 中间件 (可选)
+  │
+  ▼
+ExpenseCategoriesController::index()
+  │
+  ├─ ExpenseCategory::applyFilters(...)
+  │     → 处理 search、category_id 等业务筛选
+  │
+  └─ ExpenseCategory::whereCompany()
+        → 读 request()->header('company') → "1"（校正后的值）
+        → WHERE company_id = 1
+  ▼
+返回：公司 1 下的分类（而非用户传的 5）
+```
+
+**结果**：用户传了 `company=5`，但拿到的是公司 1 的数据。请求参数**只是建议**，中间件才是真正的裁决者。
+
+---
+
+### 8.5 两套机制的对比：为什么 PDF 路由不走 header
+
+| 机制 | 适用路由 | 信息来源 | 是否经过中间件 | 越权后果 |
+|------|---------|---------|-------------|---------|
+| header + whereCompany() | API 路由（`/api/v1/...`） | `request()->header('company')` | ✅ `CompanyMiddleware` 静默校正 | 用户无感，回退默认公司 |
+| URL hash + whereCompanyId() | Web PDF 路由（`/reports/...`） | URL 段 `{hash}` 反查 company | ❌ reports 路由组未挂 company 中间件 | `authorize()` 失败直接 403 |
+
+PDF 路由不依赖 header 的根本原因：
+1. [web.php](file:///d:/fz/0601-1/solo-dogfeeding/code/49-InvoiceShelf/routes/web.php#L54-L75) 的 `reports` 组只挂了 `auth:sanctum`，**没有 `company` 中间件**，header 即使传了也不会被校正
+2. 报表 URL 需要被嵌入 iframe 或被用户复制分享，header 难以随 URL 一起传递，而 `unique_hash` 天然存在于路径中
+3. 显式 `authorize('view report', $company)` 策略比静默回退更严谨——报表数据敏感，越权时应直接拒绝而非降级展示
+
+---
+
+### 8.6 关键代码节点一览
+
+| 节点 | 文件 | 做什么 |
+|------|------|--------|
+| header 别名 | `bootstrap/app.php` | `'company' => CompanyMiddleware::class` |
+| 路由挂载顺序 | `routes/api.php` | `auth:sanctum` → `company` → `bouncer` → 控制器 |
+| header 校正 | `app/Http/Middleware/CompanyMiddleware.php` | 校验 `hasCompany()`，非法则覆盖为默认 |
+| scope 读 header | `app/Models/ExpenseCategory.php#L46-L49` | `where('company_id', request()->header('company'))` |
+| PDF 读 URL hash | `app/Http/Controllers/V1/Admin/Report/ExpensesReportController.php#L27` | `Company::where('unique_hash', $hash)` |
+| PDF 策略授权 | `app/Http/Controllers/V1/Admin/Report/ExpensesReportController.php#L29` | `$this->authorize('view report', $company)` |
+
+---
+
+## 九、关键文件索引
 
 | 角色 | 文件路径 |
 |------|---------|
@@ -752,13 +1079,17 @@ GET /api/v1/categories
 | 公司中间件 | `app/Http/Middleware/CompanyMiddleware.php` |
 | 支出请求（含 base_amount 计算） | `app/Http/Requests/ExpenseRequest.php` |
 | 分类创建请求（无唯一约束） | `app/Http/Requests/ExpenseCategoryRequest.php` |
+| 分类列表控制器 | `app/Http/Controllers/V1/Admin/Expense/ExpenseCategoriesController.php` |
 | 仪表盘控制器 | `app/Http/Controllers/V1/Admin/Dashboard/DashboardController.php` |
 | 支出报表控制器 | `app/Http/Controllers/V1/Admin/Report/ExpensesReportController.php` |
 | 损益报表控制器 | `app/Http/Controllers/V1/Admin/Report/ProfitLossReportController.php` |
-| 分类列表控制器 | `app/Http/Controllers/V1/Admin/Expense/ExpenseCategoriesController.php` |
 | 报表授权策略 | `app/Policies/ReportPolicy.php` |
-| 仪表盘前端 Store | `resources/scripts/admin/stores/dashboard.js` |
+| 分类 Resource | `app/Http/Resources/ExpenseCategoryResource.php` |
 | 分类前端 Store | `resources/scripts/admin/stores/category.js` |
+| 仪表盘前端 Store | `resources/scripts/admin/stores/dashboard.js` |
 | 分类管理页视图 | `resources/scripts/admin/views/settings/ExpenseCategorySetting.vue` |
+| 支出创建页（消费分类下拉） | `resources/scripts/admin/views/expenses/Create.vue` |
+| 支出列表页（消费分类筛选） | `resources/scripts/admin/views/expenses/Index.vue` |
+| 中间件注册 | `bootstrap/app.php` |
 | API 路由 | `routes/api.php` |
 | Web 报表路由 | `routes/web.php` |
