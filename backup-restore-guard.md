@@ -219,137 +219,466 @@ public function store(Request $request): JsonResponse
 
 ---
 
-## 六、恢复防护机制 (Restore Guard)
+## 六、监控健康检查与通知
 
-### 6.1 设计理念：**无内置恢复 API = 最强防护**
+### 6.1 健康检查：备份是否还"活着"
 
-代码库**未提供任何恢复/导入 API**，这是避免恢复时覆盖运行数据的核心设计。恢复必须通过运维人员手动操作，从源头防止误操作。
+spatie/backup 在每次 `backup:run` 或 `backup:monitor` 执行时，会遍历 `monitor_backups` 配置中声明的磁盘，对每个磁盘上的备份做两项检查：
 
-### 6.2 多层防护体系
-
-#### 第一层：类型隔离 - 避免整体覆盖
-
-三种备份类型 [AdminBackupModal.vue#L40-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/scripts/features/admin/components/settings/AdminBackupModal.vue#L40-L44):
-```typescript
-const backupTypeOptions: BackupTypeOption[] = [
-  { id: 'full', label: 'full' },        // 完整备份
-  { id: 'only-db', label: 'only-db' },  // 仅数据库
-  { id: 'only-files', label: 'only-files' }, // 仅文件
-]
-```
-
-**文件名前缀标记** [CreateBackupJob.php#L51-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Jobs/CreateBackupJob.php#L51-L55):
+**配置入口** [config/backup.php#L267-L276](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L267-L276):
 ```php
-if (! empty($this->data['option'])) {
-    $prefix = str_replace('_', '-', $this->data['option']).'-';
-    $backupJob->setFilename($prefix.date('Y-m-d-H-i-s').'.zip');
-}
-```
-
-生成的文件名示例:
-- `only-db-2024-06-17-15-30-00.zip`
-- `only-files-2024-06-17-15-30-00.zip`
-- `2024-06-17-15-30-00.zip` (完整备份无前缀)
-
-#### 第二层：加密防护 - 数据机密性
-
-- AES-256 加密 ZIP 包
-- 密码通过环境变量 `BACKUP_ARCHIVE_PASSWORD` 配置
-- 无密码无法解压查看或恢复
-
-#### 第三层：权限与访问控制
-
-1. **API 权限** [BackupsController.php#L24](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Controllers/Admin/BackupsController.php#L24):
-   ```php
-   $this->authorize('manage backups');
-   ```
-
-2. **路由中间件** [routes/api.php#L190-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/routes/api.php#L190-L191):
-   ```php
-   Route::middleware(['auth:sanctum', 'company'])->group(function () {
-       Route::middleware(['bouncer'])->group(function () {
-           Route::apiResource('backups', BackupsController::class);
-       });
-   });
-   ```
-
-#### 第四层：路径安全 - 防止路径遍历攻击
-
-**PathToZip 验证规则** [PathToZip.php#L24-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/PathToZip.php#L24-L29):
-```php
-public function validate(string $attribute, mixed $value, Closure $fail): void
-{
-    if (! Str::endsWith($value, '.zip')) {
-        $fail('The given value must be a path to a zip file.');
-    }
-}
-```
-
-**BackupDisk 验证规则** [BackupDisk.php#L23-L30](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/BackupDisk.php#L23-L30):
-```php
-public function validate(string $attribute, mixed $value, Closure $fail): void
-{
-    $configuredBackupDisks = config('backup.backup.destination.disks');
-    if (! in_array($value, $configuredBackupDisks)) {
-        $fail('This disk is not configured as a backup disk.');
-    }
-}
-```
-
-#### 第五层：网络安全 - SSRF 防护
-
-**PrivateNetworkGuard** 在 `FileDiskService::validateCredentials()` 中使用，防止备份目标配置指向内部网络:
-- 阻止私有IP段 (10/8, 172.16/12, 192.168/16)
-- 阻止回环地址 (127.0.0.1, ::1)
-- 阻止链路本地地址 (169.254/16, fe80::/10)
-- 阻止云元数据服务 (169.254.169.254)
-- 阻止非 HTTP/HTTPS 协议
-
-#### 第六层：维护模式 - 恢复操作参考
-
-虽然无内置恢复 API，但 `ResetApp` 命令展示了正确的恢复操作流程:
-
-**ResetApp 流程** [ResetApp.php#L56-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Console/Commands/ResetApp.php#L56-L88):
-```php
-public function handle(): void
-{
-    // 1. 激活维护模式，阻止用户访问
-    Artisan::call('down');
-    
-    // 2. 执行数据操作 (迁移/种子)
-    Artisan::call('migrate:fresh --seed --force');
-    Artisan::call('db:seed', ['--class' => 'DemoSeeder', '--force' => true]);
-    
-    // 3. 清理缓存
-    Artisan::call('optimize:clear');
-    
-    // 4. 关闭维护模式
-    Artisan::call('up');
-}
-```
-
-> **恢复操作最佳实践**：应参照此模式，在恢复前启用 `down` 维护模式，恢复完成后再 `up`。
-
-#### 第七层：自动清理 - 版本管理
-
-**清理策略** [config/backup.php#L289-L339](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L289-L339):
-```php
-'strategy' => DefaultStrategy::class,
-'default_strategy' => [
-    'keep_all_backups_for_days' => 7,        // 7天内全部保留
-    'keep_daily_backups_for_days' => 16,     // 16天内每日保留
-    'keep_weekly_backups_for_weeks' => 8,    // 8周内每周保留
-    'keep_monthly_backups_for_months' => 4,  // 4月内每月保留
-    'keep_yearly_backups_for_years' => 2,    // 2年内每年保留
-    'delete_oldest_backups_when_using_more_megabytes_than' => 5000, // 存储上限
+'monitor_backups' => [
+    [
+        'name' => env('APP_NAME', 'laravel-backup'),
+        'disks' => ['local'],
+        'health_checks' => [
+            MaximumAgeInDays::class => 1,
+            MaximumStorageInMegabytes::class => 5000,
+        ],
+    ],
 ],
 ```
 
-> **重要保证**：DefaultStrategy 永远不会删除最新的备份，无论配置如何。
+**检查逻辑**：
+
+| 检查项 | 默认阈值 | 含义 |
+|--------|---------|------|
+| `MaximumAgeInDays` | 1 天 | 最新的备份不能超过 1 天前，否则视为"过期" |
+| `MaximumStorageInMegabytes` | 5000 MB | 所有备份总大小不能超过 5 GB |
+
+**判定流程**：
+
+```
+spatie 运行监控 → 遍历 monitor_backups 条目
+  → 对每个磁盘读取备份列表 → 逐项检查 MaximumAgeInDays / MaximumStorageInMegabytes
+    → 全部通过 → 触发 HealthyBackupWasFoundNotification
+    → 任一不通过 → 触发 UnhealthyBackupWasFoundNotification
+```
+
+### 6.2 通知：备份出了什么事，谁会知道
+
+spatie/backup 在 6 个事件点发出通知，每个通知可投递到 mail / slack / discord 三个渠道：
+
+**配置入口** [config/backup.php#L209-L217](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L209-L217):
+```php
+'notifications' => [
+    'notifications' => [
+        BackupHasFailedNotification::class          => ['mail'],
+        UnhealthyBackupWasFoundNotification::class  => ['mail'],
+        CleanupHasFailedNotification::class         => ['mail'],
+        BackupWasSuccessfulNotification::class      => ['mail'],
+        HealthyBackupWasFoundNotification::class    => ['mail'],
+        CleanupWasSuccessfulNotification::class     => ['mail'],
+    ],
+],
+```
+
+**6 种通知的触发场景**：
+
+| 通知类 | 触发时机 | 严重程度 |
+|--------|---------|----------|
+| `BackupHasFailedNotification` | 备份过程中抛出异常 | 🔴 关键 |
+| `UnhealthyBackupWasFoundNotification` | 健康检查不通过（过期/超量） | 🟡 警告 |
+| `CleanupHasFailedNotification` | 清理旧备份时异常 | 🟡 警告 |
+| `BackupWasSuccessfulNotification` | 备份成功完成 | 🟢 正常 |
+| `HealthyBackupWasFoundNotification` | 健康检查通过 | 🟢 正常 |
+| `CleanupWasSuccessfulNotification` | 清理完成 | 🟢 正常 |
+
+**投递链路**：
+
+```
+事件触发 → spatie 创建 Notification 实例
+  → 通过 Notifiable 类（默认）发送
+    → 按 notifications 配置的渠道分发
+      → mail:    发到 config('backup.notifications.mail.to')
+      → slack:   发到 config('backup.notifications.slack.webhook_url')
+      → discord: 发到 config('backup.notifications.discord.webhook_url')
+```
+
+> **当前状态**：mail.to 仍为 `your@example.com` 示例值，slack/discord webhook 均为空字符串。需要运维人员配置真实值后通知才会实际生效。
+
+### 6.3 队列容错：备份任务挂了怎么办
+
+`CreateBackupJob` 实现了 `ShouldQueue` 接口 [CreateBackupJob.php#L13](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Jobs/CreateBackupJob.php#L13)，由 Laravel 队列系统驱动。
+
+**容错机制分两层**：
+
+**第一层：spatie/backup 自身配置** [config/backup.php#L190-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L190-L199)：
+```php
+'tries' => 1,          // 备份命令遇到异常时的重试次数
+'retry_delay' => 0,    // 重试间隔（秒）
+```
+清理任务同理 [config/backup.php#L344-L350](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L344-L350)。
+
+**第二层：Laravel 队列系统**：
+
+```
+BackupsController@store
+  → dispatch(new CreateBackupJob($data))
+      ->onQueue(config('backup.queue.name'))
+```
+
+- 默认队列连接: `env('QUEUE_CONNECTION', 'sync')` [config/queue.php#L16](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/queue.php#L16)
+- `sync` 连接 = 同步执行，无重试
+- 若切换为 `database` / `redis` 等异步连接，Laravel 队列的 `retry_after`、`tries` 等机制自动生效
+
+**两个 `tries` 的区别**：
+- `config/backup.tries`：spatie 内部 artisan 命令级重试，控制的是 `backup:run` / `backup:clean` 命令本身
+- Laravel 队列的 `$tries`：控制的是 `CreateBackupJob` 这个 Job 被队列 worker 重新执行的次数
+
+**失败信号流转**：
+
+```
+备份失败 → spatie 内部 tries=1 不重试
+  → 触发 BackupHasFailedNotification (mail)
+  → Job 在队列中标记为 failed
+  → 若配置了异步队列且有 tries > 1 → worker 自动重试
+  → 仍失败 → 写入 failed_jobs 表
+```
 
 ---
 
-## 七、三块逻辑协同关系图
+## 七、凭证校验与 SSRF 防护链路
+
+### 7.1 问题：管理员配置备份磁盘时，endpoint 字段可以填什么？
+
+S3 兼容存储和 DigitalOcean Spaces 都需要 `endpoint` 字段。如果攻击者（或被入侵的管理员账号）将 endpoint 设为 `http://169.254.169.254`（云元数据服务），服务器就会带着 S3 凭证去请求内部网络，这就是 SSRF。
+
+### 7.2 两道拦截的完整代码链路
+
+**第一道：表单验证时拦截（保存前）**
+
+```
+前端提交磁盘配置
+  → DiskEnvironmentRequest::rules()
+    → credentials.endpoint 字段挂了 PublicHttpUrl 规则
+      → PublicHttpUrl::validate()
+        → PrivateNetworkGuard::blockedReason($url)
+          → 解析 URL → 检查 scheme (仅 http/https)
+            → 提取 host → filter_var 是否 IP 直连
+              → 是: ipIsBlocked() 直接检查
+              → 否: resolveHost() 做 DNS 查询 → 逐 IP 检查
+            → 返回 blocked 原因 或 null (允许)
+          → blocked !== null → $fail() 拒绝
+```
+
+关键代码 [DiskEnvironmentRequest.php#L43-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Requests/DiskEnvironmentRequest.php#L43-L48):
+```php
+'credentials.endpoint' => [
+    'nullable',
+    'string',
+    'url',
+    new PublicHttpUrl,   // ← SSRF 第一道拦截
+],
+```
+
+[PublicHttpUrl.php#L21-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/PublicHttpUrl.php#L21-L29):
+```php
+public function validate(string $attribute, mixed $value, Closure $fail): void
+{
+    if (! is_string($value) || trim($value) === '') {
+        return;
+    }
+    if (PrivateNetworkGuard::blockedReason($value) !== null) {
+        $fail('The :attribute must be a publicly reachable URL, not a private or reserved address.');
+    }
+}
+```
+
+**第二道：凭证验证时拦截（连通性测试前）**
+
+即使表单验证通过了（比如 hostname 当时解析到公网 IP，后来 DNS 被篡改），`FileDiskService::validateCredentials()` 在真正尝试写入测试文件前，还会再次检查 endpoint：
+
+```
+DiskController@store
+  → FileDiskService::validateCredentials($credentials, $driver)
+    → 检查 credentials['endpoint'] 是否存在
+      → PrivateNetworkGuard::blockedReason($endpoint)
+        → 同样的 IP/DNS 检查逻辑
+      → blocked !== null → return false (校验失败)
+    → 通过 SSRF 检查后，才创建临时磁盘做连通性测试
+      → Storage::disk('validation_temp')->put('invoiceshelf_temp.text', ...)
+      → 成功写入再删除 → return true
+      → 异常 → return false
+```
+
+关键代码 [FileDiskService.php#L105-L149](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/FileDiskService.php#L105-L149):
+```php
+public function validateCredentials(array $credentials, string $driver): bool
+{
+    // SSRF guard: 在真正发请求之前再次拦截
+    if (isset($credentials['endpoint'])
+        && is_string($credentials['endpoint'])
+        && $credentials['endpoint'] !== ''
+        && PrivateNetworkGuard::blockedReason($credentials['endpoint']) !== null) {
+        return false;
+    }
+
+    // 通过后才做连通性测试...
+    $tempDiskName = 'validation_temp';
+    config(['filesystems.disks.'.$tempDiskName => $baseConfig]);
+    \Storage::disk($tempDiskName)->put($root.'invoiceshelf_temp.text', 'Check Credentials');
+    // ...
+}
+```
+
+**两道拦截的分工**：
+
+| 拦截点 | 时机 | 用途 |
+|--------|------|------|
+| `PublicHttpUrl` 规则 | 表单提交时 | 前端 UX 反馈，告诉用户"这个地址不可达" |
+| `validateCredentials()` | 连通性测试前 | 运行时再次确认，防止 DNS rebinding 或直接绕过表单 |
+
+### 7.3 PrivateNetworkGuard 拦截了什么
+
+[PrivateNetworkGuard.php#L37-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/FileDiskService.php#L37-L68) 定义了两张 CIDR 黑名单：
+
+**IPv4 黑名单**：
+- `0.0.0.0/8` — "this" 网络
+- `10.0.0.0/8` — RFC1918 私有
+- `100.64.0.0/10` — 运营商级 NAT
+- `127.0.0.0/8` — 回环
+- `169.254.0.0/16` — 链路本地（含云元数据 169.254.169.254）
+- `172.16.0.0/12` — RFC1918 私有
+- `192.168.0.0/16` — RFC1918 私有
+- `240.0.0.0/4` — 保留（含广播地址）
+
+**IPv6 黑名单**：
+- `::1/128` — 回环
+- `fc00::/7` — 唯一本地地址
+- `fe80::/10` — 链路本地
+
+**DNS 解析行为**：对 hostname 做 `gethostbynamel()` (A 记录) + `dns_get_record(DNS_AAAA)` 查询，每个解析出的 IP 都检查。**不可解析的 hostname 视为"不危险"放行**（fail-open），因为请求一个不存在的域名不会打到内网。
+
+---
+
+## 八、恢复防护机制 (Restore Guard)
+
+### 核心设计：**无内置恢复 API = 源头防护**
+
+代码库**未提供任何恢复/导入 API**。所有恢复操作必须由运维人员通过 `php artisan` 命令或数据库工具手动执行。这是避免恢复时覆盖运行数据的最根本防护。
+
+下面按「挡覆盖、守机密、防误操作」三组展开。
+
+---
+
+### 8.1 挡覆盖：恢复时如何避免压坏正在运行的数据
+
+#### 问题场景
+
+恢复一个 `full` 备份意味着：用备份中的 SQL 覆盖当前数据库 + 用备份中的文件覆盖当前文件系统。如果应用正在服务请求，就会出现：
+- 数据库刚覆盖一半，新请求写入的行与旧数据不一致
+- 文件系统覆盖到一半，正在读取的 PDF 模板损坏
+- 队列中的 Job 引用了已经不存在的记录
+
+#### 防护手段 A：备份类型隔离 — 允许只恢复一半
+
+**前端选择** [AdminBackupModal.vue#L40-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/scripts/features/admin/components/settings/AdminBackupModal.vue#L40-L44)：
+
+```typescript
+const backupTypeOptions = [
+  { id: 'full', label: 'full' },
+  { id: 'only-db', label: 'only-db' },
+  { id: 'only-files', label: 'only-files' },
+]
+```
+
+**后端执行** [CreateBackupJob.php#L43-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Jobs/CreateBackupJob.php#L43-L55)：
+
+```php
+if ($this->data['option'] === 'only-db') {
+    $backupJob->dontBackupFilesystem();   // ZIP 包中不含文件系统
+}
+if ($this->data['option'] === 'only-files') {
+    $backupJob->dontBackupDatabases();    // ZIP 包中不含数据库 dump
+}
+```
+
+**恢复 only-db 时避免压坏文件数据**：
+
+`only-db-2024-06-17-15-30-00.zip` 内部结构：
+```
+only-db-2024-06-17-15-30-00.zip
+  └── db-dumps/
+        └── database.sql
+```
+
+恢复时只导入 `database.sql`，**不会触碰任何文件**。这意味着：
+- `public/media/` 下所有发票附件、收据、Logo 完好无损
+- `storage/app/templates/` 下的 PDF 模板完好无损
+- `.env` 配置文件完好无损
+
+**恢复 only-files 时避免压坏数据库**：
+
+`only-files-2024-06-17-15-30-00.zip` 内部结构：
+```
+only-files-2024-06-17-15-30-00.zip
+  └── (项目文件，不含 db-dumps/)
+```
+
+恢复时只覆盖文件系统，**不会触碰数据库**。这意味着：
+- 正在运行的数据库记录（包括用户会话、待处理队列）完好无损
+- 恢复后应用无需重新迁移
+
+**文件名前缀是运维人员的"路标"**：
+
+| 文件名前缀 | ZIP 内容 | 恢复影响范围 |
+|-----------|---------|------------|
+| `only-db-` | 仅 `db-dumps/database.sql` | 仅数据库行 |
+| `only-files-` | 仅项目文件 | 仅文件系统 |
+| 无前缀 | `db-dumps/` + 项目文件 | 全部 |
+
+运维人员在解压前看到文件名就能判断这个包会影响什么，避免误操作"全套覆盖"。
+
+#### 防护手段 B：维护模式 — 恢复前锁门
+
+[ResetApp.php#L56-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Console/Commands/ResetApp.php#L56-L88) 展示了正确的数据操作流程：
+
+```php
+// 1. 先锁门 — 任何用户请求都返回 503
+Artisan::call('down');
+
+// 2. 执行数据操作
+Artisan::call('migrate:fresh --seed --force');
+
+// 3. 清理缓存
+Artisan::call('optimize:clear');
+
+// 4. 开门
+Artisan::call('up');
+```
+
+**为什么恢复前必须 `down`**：
+
+- 阻止所有 HTTP 请求，防止"数据库覆盖一半时有人写入"
+- 阻止队列 worker 获取新 Job，防止 Job 操作的数据与备份不一致
+- 阻止定时任务执行，防止 cron 任务在半恢复状态下修改数据
+
+**only-db 恢复的推荐流程**：
+
+```bash
+php artisan down
+# 导入 only-db 备份的 database.sql
+mysql -u user -p database < database.sql
+php artisan optimize:clear    # 清除所有缓存（config/route/view）
+php artisan up
+```
+
+**only-files 恢复的推荐流程**：
+
+```bash
+php artisan down
+# 解压 only-files 备份到项目目录
+unzip only-files-2024-06-17-15-30-00.zip -d /path/to/project/
+php artisan optimize:clear
+php artisan up
+```
+
+#### 防护手段 C：自动清理 — 保证恢复点可用
+
+[config/backup.php#L289-L339](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L289-L339) 的 `DefaultStrategy` 保证：
+- **永远不删最新的备份**（无论配置如何）
+- 按时间梯度保留：7天全保留 → 16天日保留 → 8周日保留 → 4月月保留 → 2年年保留
+- 存储上限 5000 MB
+
+这意味着即使恢复操作失败，最新的备份点一定还在。
+
+---
+
+### 8.2 守机密：备份文件如何防止未授权访问
+
+#### 加密：AES-256 保护备份内容
+
+[config/backup.php#L179-L188](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L179-L188)：
+```php
+'password' => env('BACKUP_ARCHIVE_PASSWORD'),
+'encryption' => 'default',  // 即 ZipArchive::EM_AES_256
+```
+
+- 密码通过 `.env` 注入，不进代码仓库
+- 不设密码（`null`）则禁用加密
+- 无密码无法解压 → 无法恢复 → 无法泄露数据
+
+#### 权限：谁能操作备份 API
+
+**三层权限锁** [routes/api.php#L190-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/routes/api.php#L190-L191)：
+
+```
+请求 → auth:sanctum (必须有有效 API Token)
+     → company (必须设置 company header)
+     → bouncer (必须有 manage backups 权限)
+     → BackupsController 中 $this->authorize('manage backups')
+```
+
+#### 路径安全：防止路径遍历
+
+**PathToZip** [PathToZip.php#L24-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/PathToZip.php#L24-L29)：
+- 删除/下载备份时，`path` 参数必须以 `.zip` 结尾
+- 防止通过 `path=../../etc/passwd` 读取任意文件
+
+**BackupDisk** [BackupDisk.php#L23-L30](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/BackupDisk.php#L23-L30)：
+- `disk` 参数必须在 `config('backup.backup.destination.disks')` 列表中
+- 防止访问未授权的磁盘
+
+#### SSRF 防护：防止备份目标指向内部网络
+
+详见第七章「凭证校验与 SSRF 防护链路」。两道拦截确保备份磁盘的 endpoint 不会指向内部服务。
+
+---
+
+### 8.3 防误操作：如何阻止错误的人做错误的事
+
+#### 无恢复 API — 最强的误操作防护
+
+代码库中**没有任何** `restore` / `import` 端点。对比 `BackupsController` 只有 `index / store / destroy / download` 四个动作——能创建、能列出、能删除、能下载，**唯独不能通过 API 恢复**。
+
+这意味着：
+- 拥有 `manage backups` 权限的用户**也不能一键恢复**
+- 恢复需要服务器命令行权限 + `BACKUP_ARCHIVE_PASSWORD` 密码
+- 恢复操作天然需要运维级别的访问权限
+
+#### 确认对话框 — 删除前的二次确认
+
+[AdminBackupView.vue#L147-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/scripts/features/admin/views/settings/AdminBackupView.vue#L147-L155)：
+
+```typescript
+const confirmed = await dialogStore.openDialog({
+  title: t('general.are_you_sure'),
+  message: t('settings.backup.backup_confirm_delete'),
+  variant: 'danger',
+  // ...
+})
+if (!confirmed) return
+```
+
+#### 磁盘删除保护 — 有文件的磁盘不让删
+
+[DiskController.php#L161-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Controllers/Admin/Settings/DiskController.php#L161-L189)：
+
+```php
+// 系统磁盘不能删
+if ($disk->type === 'SYSTEM') {
+    return respondJson('not_allowed', 'System disks cannot be deleted.');
+}
+
+// 默认磁盘不能删
+if ($disk->setAsDefault()) {
+    return respondJson('not_allowed', 'The default disk cannot be deleted.');
+}
+
+// 有文件的磁盘不能删
+$mediaCount = DB::table('media')
+    ->where('disk', $diskName)->count();
+if ($mediaCount > 0) {
+    return respondJson('disk_has_files', 'Cannot delete this disk — it contains ...');
+}
+```
+
+三重保护：系统盘锁 → 默认盘锁 → 有文件锁。防止误删备份目标磁盘导致备份丢失。
+
+---
+
+## 九、三块逻辑协同关系图
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -394,40 +723,45 @@ public function handle(): void
                     └──────────┬───────────┘
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      恢复防护层 (被动防护)                       │
+│                      恢复防护层                                  │
 │                                                                 │
-│  类型隔离    加密保护    权限控制    路径安全    SSRF防护       │
-│  ────────   ────────   ────────   ────────   ────────          │
-│  full       AES-256    manage     PathToZip   PrivateNetwork   │
-│  only-db    env 密码   backups    BackupDisk    Guard          │
-│  only-files           auth:      仅.zip路径                    │
-│  文件名前缀            sanctum                                 │
+│  ┌─ 挡覆盖 ──────────────────────────────────────────────┐     │
+│  │ • 备份类型隔离 (only-db / only-files / full)          │     │
+│  │ • 文件名前缀标记 (only-db- / only-files-)             │     │
+│  │ • 维护模式 (down → 操作 → up)                        │     │
+│  │ • 自动清理保底 (永远不删最新备份)                      │     │
+│  └───────────────────────────────────────────────────────┘     │
 │                                                                 │
-│  自动清理策略    维护模式参考    无内置恢复API                   │
-│  ──────────    ──────────    ─────────────                    │
-│  7天全保留       down/up       人工操作，源头防误操作           │
-│  16天每日                                                │
-│  8周每周                                                 │
-│  4月每月                                                 │
-│  2年每年                                                 │
-│  5000MB上限                                              │
+│  ┌─ 守机密 ──────────────────────────────────────────────┐     │
+│  │ • AES-256 加密 ZIP 包 (BACKUP_ARCHIVE_PASSWORD)      │     │
+│  │ • 三层权限锁 (sanctum → company → bouncer)            │     │
+│  │ • 路径安全 (PathToZip / BackupDisk 规则)              │     │
+│  │ • SSRF 防护 (PublicHttpUrl + validateCredentials)     │     │
+│  └───────────────────────────────────────────────────────┘     │
+│                                                                 │
+│  ┌─ 防误操作 ────────────────────────────────────────────┐    │
+│  │ • 无恢复 API (最根本的防护)                           │    │
+│  │ • 删除前确认对话框                                    │    │
+│  │ • 磁盘删除三重保护 (系统/默认/有文件)                  │    │
+│  └───────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 八、关键安全要点总结
+## 十、关键安全要点总结
 
-### 8.1 避免恢复时覆盖运行数据的核心机制
+### 10.1 only-db / only-files 单独恢复时避免压坏运行数据
 
-1. **无恢复 API**：最根本的防护，所有恢复必须人工执行
-2. **类型分离**：`only-db` / `only-files` 允许选择性恢复，避免整体覆盖
-3. **维护模式**：恢复操作应先 `down` 再操作，最后 `up`
-4. **权限控制**：只有 `manage backups` 权限的用户可操作
-5. **加密保护**：备份文件加密，避免未授权访问
-6. **文件名时间戳**：便于版本追溯，避免恢复错误版本
+| 恢复类型 | ZIP 包内容 | 不会影响 | 需要配合的操作 |
+|---------|-----------|---------|-------------|
+| `only-db` | `db-dumps/database.sql` | 文件系统（媒体、模板、.env） | `down` → 导入 SQL → `optimize:clear` → `up` |
+| `only-files` | 项目文件（无 db-dumps/） | 数据库（记录、会话、队列） | `down` → 解压文件 → `optimize:clear` → `up` |
+| `full` | 上述全部 | 无 | `down` → 导入 SQL + 解压文件 → `optimize:clear` → `up` |
 
-### 8.2 风险点与改进建议
+**核心原则**：无论哪种类型，恢复前必须 `php artisan down`，恢复后必须 `php artisan optimize:clear`。
+
+### 10.2 风险点与改进建议
 
 1. **缺少自动备份调度**：当前仅支持手动备份，建议根据业务需求添加定期自动备份
 2. **缺少恢复校验流程**：无内置的备份完整性校验，建议定期执行备份恢复演练
@@ -435,7 +769,7 @@ public function handle(): void
 
 ---
 
-## 九、代码文件索引
+## 十一、代码文件索引
 
 | 模块 | 核心文件 |
 |------|----------|
@@ -444,10 +778,14 @@ public function handle(): void
 | 配置工厂 | [BackupConfigurationFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/BackupConfigurationFactory.php) |
 | 备份服务 | [BackupService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/BackupService.php) |
 | 文件磁盘服务 | [FileDiskService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/FileDiskService.php) |
+| 磁盘控制器 | [DiskController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Controllers/Admin/Settings/DiskController.php) |
+| 表单验证 | [DiskEnvironmentRequest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Requests/DiskEnvironmentRequest.php) |
+| SSRF 防护 | [PrivateNetworkGuard.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php) |
+| URL 验证规则 | [PublicHttpUrl.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/PublicHttpUrl.php) |
 | 验证规则 | [PathToZip.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/PathToZip.php), [BackupDisk.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/BackupDisk.php) |
 | 调度配置 | [console.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/routes/console.php) |
 | 备份配置 | [config/backup.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php) |
-| 前端页面 | [AdminBackupView.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/script/features/admin/views/settings/AdminBackupView.vue), [AdminBackupModal.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/script/features/admin/components/settings/AdminBackupModal.vue) |
-| API 服务 | [backup.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/script/api/services/backup.service.ts) |
-| 测试用例 | [BackupTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/tests/Feature/Admin/BackupTest.php), [BackupGlobalTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/tests/Feature/Admin/BackupGlobalTest.php) |
+| 前端页面 | [AdminBackupView.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/scripts/features/admin/views/settings/AdminBackupView.vue), [AdminBackupModal.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/scripts/features/admin/components/settings/AdminBackupModal.vue) |
+| API 服务 | [backup.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/resources/scripts/api/services/backup.service.ts) |
+| 测试用例 | [BackupTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/tests/Feature/Admin/BackupTest.php), [BackupGlobalTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/tests/Feature/Admin/BackupGlobalTest.php), [PrivateNetworkGuardTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/tests/Unit/PrivateNetworkGuardTest.php) |
 | 参考流程 | [ResetApp.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Console/Commands/ResetApp.php) |
