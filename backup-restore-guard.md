@@ -429,26 +429,137 @@ public function validateCredentials(array $credentials, string $driver): bool
 | `PublicHttpUrl` 规则 | 表单提交时 | 前端 UX 反馈，告诉用户"这个地址不可达" |
 | `validateCredentials()` | 连通性测试前 | 运行时再次确认，防止 DNS rebinding 或直接绕过表单 |
 
-### 7.3 PrivateNetworkGuard 拦截了什么
+### 7.3 完整 CIDR 黑名单
 
-[PrivateNetworkGuard.php#L37-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/FileDiskService.php#L37-L68) 定义了两张 CIDR 黑名单：
+[PrivateNetworkGuard.php#L37-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php#L37-L68) 定义了 19 条 CIDR 规则，覆盖 IPv4、IPv6、IPv4-mapped IPv6 三条线：
 
-**IPv4 黑名单**：
-- `0.0.0.0/8` — "this" 网络
-- `10.0.0.0/8` — RFC1918 私有
-- `100.64.0.0/10` — 运营商级 NAT
-- `127.0.0.0/8` — 回环
-- `169.254.0.0/16` — 链路本地（含云元数据 169.254.169.254）
-- `172.16.0.0/12` — RFC1918 私有
-- `192.168.0.0/16` — RFC1918 私有
-- `240.0.0.0/4` — 保留（含广播地址）
+**IPv4 黑名单（13 条）** [PrivateNetworkGuard.php#L37-L51](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php#L37-L51)：
 
-**IPv6 黑名单**：
-- `::1/128` — 回环
-- `fc00::/7` — 唯一本地地址
-- `fe80::/10` — 链路本地
+| CIDR | RFC | 覆盖范围 | 典型攻击向量 |
+|------|-----|---------|------------|
+| `0.0.0.0/8` | RFC1122 | "this" 网络 / 未指定 | 绕过防火墙 |
+| `10.0.0.0/8` | RFC1918 | 私有 A 类 | 内网扫描 |
+| `100.64.0.0/10` | RFC6598 | 运营商级 NAT (CGN) | 相邻租户 |
+| `127.0.0.0/8` | RFC1122 | 回环 | 本地服务 |
+| `169.254.0.0/16` | RFC3927 | 链路本地 | **云元数据 169.254.169.254** |
+| `172.16.0.0/12` | RFC1918 | 私有 B 类 (172.16–172.31) | 内网扫描 |
+| `192.0.0.0/24` | RFC6890 | IETF 协议分配 | 协议攻击 |
+| `192.0.2.0/24` | RFC5737 | TEST-NET-1 文档 | 伪装 |
+| `192.168.0.0/16` | RFC1918 | 私有 C 类 | 内网扫描 |
+| `198.18.0.0/15` | RFC2544 | 基准测试 | 伪装 |
+| `198.51.100.0/24` | RFC5737 | TEST-NET-2 文档 | 伪装 |
+| `203.0.113.0/24` | RFC5737 | TEST-NET-3 文档 | 伪装 |
+| `240.0.0.0/4` | RFC1112 | 保留 (含 255.255.255.255 广播) | 广播风暴 |
 
-**DNS 解析行为**：对 hostname 做 `gethostbynamel()` (A 记录) + `dns_get_record(DNS_AAAA)` 查询，每个解析出的 IP 都检查。**不可解析的 hostname 视为"不危险"放行**（fail-open），因为请求一个不存在的域名不会打到内网。
+**IPv6 黑名单（6 条）** [PrivateNetworkGuard.php#L61-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php#L61-L68)：
+
+| CIDR | 覆盖范围 | 典型攻击向量 |
+|------|---------|------------|
+| `::1/128` | 回环 | 本地服务 |
+| `::/128` | 未指定 | 绕过 |
+| `fc00::/7` | 唯一本地地址 (ULA) | 内网扫描 |
+| `fe80::/10` | 链路本地 | 相邻节点 |
+| `64:ff9b::/96` | NAT64 (嵌入 IPv4) | 间接内网访问 |
+| `2001:db8::/32` | 文档 | 伪装 |
+
+**IPv4-mapped IPv6 处理** [PrivateNetworkGuard.php#L137-L143](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php#L137-L143)：
+
+```php
+public static function ipIsBlocked(string $ip): bool
+{
+    $mapped = self::extractMappedIpv4($ip);
+    if ($mapped !== null) {
+        return self::ipIsBlocked($mapped);  // 递归到 IPv4 检查
+    }
+    // ...
+}
+```
+
+`::ffff:10.0.0.1` 这种 IPv4-mapped IPv6 地址会被 [extractMappedIpv4()](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php#L229-L245) 拆出内嵌的 `10.0.0.1`，然后递归走 IPv4 黑名单。测试用例 [PrivateNetworkGuardTest.php#L23](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/tests/Unit/PrivateNetworkGuardTest.php#L23) 明确覆盖了这种情况：
+```php
+'ipv4-mapped v6' => 'http://[::ffff:10.0.0.1]',
+```
+
+### 7.4 五个出站调用方的防护边界
+
+`PrivateNetworkGuard` 是一个**全系统复用**的 SSRF 守卫，不仅服务备份磁盘，还保护 AI、PDF、汇率三个出站链路。五个调用点按调用方式分为两类：
+
+**第一类：`blockedReason()` — 返回 null / string，用于验证规则和保存前检查**
+
+| # | 调用方 | 代码位置 | 防护的 URL 来源 | 检查时机 |
+|---|--------|---------|---------------|---------|
+| 1 | `PublicHttpUrl` 验证规则 | [PublicHttpUrl.php#L27](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/PublicHttpUrl.php#L27) | S3/Spaces endpoint（通过 `DiskEnvironmentRequest`） | 表单提交时 |
+| 2 | `FileDiskService::validateCredentials()` | [FileDiskService.php#L112](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/FileDiskService.php#L112) | S3/Spaces endpoint | 连通性测试前 |
+
+**第二类：`assertAllowed()` — 抛出 `BlockedUrlException`，用于运行时出站请求前**
+
+| # | 调用方 | 代码位置 | 防护的 URL 来源 | 检查时机 |
+|---|--------|---------|---------------|---------|
+| 3 | `OpenRouterDriver::getBaseUrl()` | [OpenRouterDriver.php#L224](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Ai/OpenRouterDriver.php#L224) | AI base_url (公司级配置) | 每次 AI 请求前 |
+| 4 | `GotenbergPdfDriver::loadView()` | [GotenbergPdfDriver.php#L25](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Pdf/GotenbergPdfDriver.php#L25) | Gotenberg host (env 配置) | 每次 PDF 生成前 |
+| 5 | `CurrencyConverterDriver::getBaseUrl()` | [CurrencyConverterDriver.php#L61](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/ExchangeRate/CurrencyConverterDriver.php#L61) | DEDICATED 计划 URL (公司级配置) | 每次汇率查询前 |
+
+**五个调用方的威胁模型对比**：
+
+| 调用方 | 谁能设置 URL | 附着的凭证 | 攻击后果 |
+|--------|------------|-----------|---------|
+| FileDisk (1,2) | 管理员 | S3 Access Key + Secret | 泄露存储凭证 |
+| OpenRouter (3) | 公司 owner | Bearer API Token | 泄露 AI 密钥 |
+| Gotenberg (4) | 运维 (env) | 无（但可读取渲染内容） | SSRF 读内网 |
+| CurrencyConverter (5) | 公司 owner | API Key | 泄露汇率密钥 |
+
+**OpenRouterDriver 的 memoization 优化**：
+
+[OpenRouterDriver.php#L29](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Ai/OpenRouterDriver.php#L29) 用 `$validatedBaseUrl` 缓存已校验的 URL，避免每次 AI 请求都重新做 DNS 解析：
+```php
+private ?string $validatedBaseUrl = null;
+
+protected function getBaseUrl(): string
+{
+    if ($this->validatedBaseUrl !== null) {
+        return $this->validatedBaseUrl;  // 缓存命中，跳过 DNS
+    }
+    // ... SSRF 检查 ...
+    return $this->validatedBaseUrl = $url;
+}
+```
+
+### 7.5 DNS Rebinding 的真实防护效果与 TOCTOU 局限
+
+**威胁模型**：攻击者控制一个域名的 DNS，让它在检查时解析到公网 IP，在真正请求时解析到内网 IP。这就是经典的 Time-Of-Check-Time-Of-Use (TOCTOU) 攻击。
+
+**当前代码的防护层级**：
+
+```
+时间线:  t0 (检查)                    t1 (请求)
+          ↓                            ↓
+DNS 响应: evil.com → 1.2.3.4 (公网)  evil.com → 10.0.0.1 (内网)
+
+blockedReason() 检查时: 解析到 1.2.3.4 → 允许
+真正 HTTP 请求时:        解析到 10.0.0.1 → 打到内网 ← 漏洞
+```
+
+**PrivateNetworkGuard 的 PHPDoc 明确承认此局限** [PrivateNetworkGuard.php#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php#L25-L28)：
+
+> Known limitation: this is not TOCTOU/DNS-rebinding-proof. A fully hardened implementation would pin the connection to the validated IP (cURL CURLOPT_RESOLVE). That is intentionally out of scope here — the realistic finding is direct private targeting, which this fully covers.
+
+**各调用方的真实防护效果**：
+
+| 调用方 | DNS rebinding 风险 | 缓解因素 |
+|--------|-------------------|---------|
+| FileDisk validateCredentials (2) | 中 — 检查与写入测试文件间有窗口 | 测试文件写入极快，窗口极小 |
+| OpenRouterDriver (3) | **低** — memoization 把 URL 和检查绑定，每次请求前才检查 | 缓存了 `validatedBaseUrl`，但跨请求 DNS 可变 |
+| GotenbergPdfDriver (4) | 中 — host 来自 env/config，非用户实时输入 | 攻击者需要先改 env 才能控制 URL |
+| CurrencyConverterDriver (5) | 中 — DEDICATED URL 是用户配置的 | 检查与请求在同一方法调用内，窗口极小 |
+| PublicHttpUrl 规则 (1) | **无运行时风险** — 仅做表单验证，不发请求 | 运行时由调用方 (2) 再次检查 |
+
+**为什么"不够硬"但"足够用"**：
+
+1. **直接内网瞄准**（把 endpoint 设为 `http://10.0.0.1`）→ 被 100% 拦截，这是最现实的攻击向量
+2. **DNS rebinding** → 需要攻击者控制 DNS + 精确控制时序，攻击门槛极高
+3. **完全硬化的方案**（cURL `CURLOPT_RESOLVE`）需要修改 PHP HTTP 客户端底层，侵入性大，项目选择有意识地不做
+
+**如需加固**：最直接的方案是在 `assertAllowed()` 检查通过后，将解析到的 IP 传入 HTTP 客户端的 `CURLOPT_RESOLVE` 选项，强制连接到已验证的 IP，而非重新做 DNS 解析。
 
 ---
 
