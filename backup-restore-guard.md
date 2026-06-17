@@ -455,6 +455,152 @@ public function store(Request $request): JsonResponse
 
 ---
 
+### 5.4 并发备份防护：同一秒内连续触发两次备份的影响
+
+公司内部有人手快点了两次备份按钮，会发生什么？这一节分析代码中所有相关的并发控制机制。
+
+#### 5.4.1 为什么控制器 store 在"没有锁"的情况下也不会挂起？
+
+**首先澄清一个误解**：`withoutOverlapping()` **根本不在备份链路上**。
+
+`withoutOverlapping()` 只出现在 [routes/console.php#L14](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/routes/console.php#L14)，是给 `reset:app` 调度命令用的：
+
+```php
+Schedule::command('reset:app --force')
+    ->daily()
+    ->runInBackground()
+    ->withoutOverlapping();  // ← 只在这儿，跟备份无关
+```
+
+**备份的 store 方法没有任何锁** [BackupsController.php#L52-L61](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Controllers/Admin/BackupsController.php#L52-L61)：
+- 没有 `withoutOverlapping()` 中间件
+- `CreateBackupJob` 没有实现 `ShouldBeUnique` 接口
+- 没有数据库级事务锁
+- 没有 Redis 分布式锁
+
+**为什么这样设计不会挂起？**
+
+因为 `dispatch()` 是**异步入队操作**，无论队列是 sync 还是 database/redis，`dispatch()` 本身都是微秒级完成的：
+
+```
+HTTP 请求 1 到达 store()
+  → authorize() (权限检查)
+  → dispatch() → 把 Job 序列化 → 写入队列/立即同步执行
+  → 返回 success: true
+
+HTTP 请求 2 到达 store()（同一秒）
+  → authorize()
+  → dispatch() → 把 Job 序列化 → 写入队列/立即同步执行
+  → 返回 success: true
+```
+
+两个请求都在 **< 10ms** 内返回，根本不会"挂起"。
+
+> 关键区别：`withoutOverlapping()` 是 `Schedule` 类的方法，用于**调度命令**防止上一次没跑完下一次又触发；而备份是**手动触发**的 HTTP 请求，走的是队列 dispatch 机制，两者是完全独立的代码路径。
+
+#### 5.4.2 两个备份 Job 并发执行的真实风险（按队列类型分）
+
+**场景 A：默认 `sync` 队列** [config/queue.php#L16](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/queue.php#L16)
+
+`sync` 队列 = 同步执行，`dispatch()` 后立即在当前 PHP 进程中跑 Job。
+
+时序如下：
+
+```
+t=0.000s:  请求 1 → store() → dispatch() → 立即执行 CreateBackupJob::handle()
+t=0.005s:  请求 1 正在 handle() 中 → BackupJobFactory::createFromConfig()
+t=0.010s:  请求 2 → store() → dispatch() → 另一个 PHP-FPM 进程 → 立即执行 handle()
+t=2.5s:    请求 1 的备份完成 → 写 ZIP 到 local 磁盘
+t=2.8s:    请求 2 的备份完成 → 写 ZIP 到 local 磁盘
+t=2.81s:   两个请求都已返回 success: true
+```
+
+**sync 队列下的风险点**：
+
+| 风险 | 是否发生 | 后果 |
+|------|---------|------|
+| 同一秒文件名冲突 | **是** | 见 5.4.3 |
+| 临时目录冲突 | **否** | 见 5.4.3 |
+| 数据库 dump 死锁 | 低概率 | mysqldump 读锁可能冲突，但不会死锁 |
+| 文件收集读取冲突 | 否 | 都是只读操作 |
+
+**场景 B：`database` / `redis` 异步队列**
+
+两个 Job 先后入队。如果有多个 queue worker，可能并发执行；如果只有一个 worker，则串行执行。
+
+**异步队列下的风险点**：
+
+| 风险 | 是否发生 | 后果 |
+|------|---------|------|
+| 同一秒文件名冲突 | **是** | 见 5.4.3 |
+| 临时目录冲突 | **否** | 见 5.4.3 |
+| 数据库 dump 死锁 | 中等概率 | 两个 mysqldump 同时跑 FLUSH TABLES WITH READ LOCK |
+| 磁盘 IO 竞争 | 是 | 两个大 ZIP 同时写，磁盘 IO 100% |
+| 内存不足 | 是 | 两个 BackupJob 同时加载 FileSelection，内存翻倍 |
+
+#### 5.4.3 秒级 ZIP 文件名和临时目录的碰撞规避
+
+**文件名生成逻辑** [CreateBackupJob.php#L51-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Jobs/CreateBackupJob.php#L51-L55)：
+
+```php
+if (! empty($this->data['option'])) {
+    $prefix = str_replace('_', '-', $this->data['option']).'-';
+    $backupJob->setFilename($prefix.date('Y-m-d-H-i-s').'.zip');
+}
+```
+
+`date('Y-m-d-H-i-s')` 的精度是**秒级**。同一秒内执行的两个备份会生成**完全相同的文件名**。
+
+**如果两个备份生成相同文件名会怎样？**
+
+分两种情况：
+
+1. **同一目标磁盘**：后完成的 ZIP 会**覆盖**先完成的 ZIP。先完成的那个备份永久丢失，没有任何警告。
+2. **不同目标磁盘**：分别写入不同磁盘，互不影响。
+
+**为什么临时目录不会冲突？**
+
+临时目录配置 [config/backup.php#L173](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L173)：
+```php
+'temporary_directory' => storage_path('app/backup-temp'),
+```
+
+表面上所有备份共享同一个临时目录，但 spatie/backup 依赖的 `spatie/temporary-directory ^2.3` 包在每次备份时会在这个目录下**创建一个随机子目录**：
+
+```
+storage/app/backup-temp/
+  ├── backup-job-1-random-string-abc123/
+  │     ├── db-dumps/database.sql
+  │     └── 2024-06-17-15-30-00.zip (正在写)
+  └── backup-job-2-random-string-def456/
+        ├── db-dumps/database.sql
+        └── 2024-06-17-15-30-00.zip (正在写)
+```
+
+每个备份 Job 的临时工作目录是**随机唯一**的，所以两个备份同时跑时：
+- 各自的 db-dumps 不会互相覆盖
+- 各自的 ZIP 写入不会互相干扰
+- 只有最终移动到目标磁盘时才会因文件名相同而覆盖
+
+**碰撞规避建议**（代码中未实现）：
+- 文件名添加微秒：`date('Y-m-d-H-i-s').'-'.microtime(true)`
+- 或添加随机后缀：`date('Y-m-d-H-i-s').'-'.Str::random(8)`
+- 或用 `uniqid()`
+
+#### 5.4.4 现有代码的并发防护总结
+
+| 防护点 | 现状 | 风险等级 |
+|--------|------|---------|
+| 控制器层锁 | ❌ 无 | 低（dispatch 太快，不会挂起） |
+| Job 唯一性锁 | ❌ 无 ShouldBeUnique | 中 |
+| 临时目录碰撞 | ✅ spatie/temporary-directory 随机子目录 | 无 |
+| 秒级文件名碰撞 | ❌ 同一秒会相同 | **高（后写覆盖先写）** |
+| 数据库 dump 并发 | ❌ 无控制 | 中 |
+
+> **最大风险**：同一秒两次备份到同一磁盘，后完成的覆盖先完成的，先完成的永久丢失且无警告。
+
+---
+
 ## 六、监控健康检查与通知
 
 ### 6.1 健康检查：备份是否还"活着"
