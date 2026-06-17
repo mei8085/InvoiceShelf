@@ -155,10 +155,246 @@ DB Dump (可选gzip) → 文件收集 → ZIP打包 → AES-256加密 → 写入
 'encryption' => 'default',  // ZipArchive::EM_AES_256
 ```
 
-### 4.3 临时文件管理
+### 4.3 临时文件管理与递归打包防护
 
-- 临时目录: `storage_path('app/backup-temp')` [config/backup.php#L173](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L173)
-- 备份完成后自动清理
+**核心问题**：为什么 temporary_directory 必须被排除，否则会发生什么？
+
+#### 4.3.1 递归打包的真实场景
+
+备份的归集范围配置如下 [config/backup.php#L28-L30](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L28-L30)：
+
+```php
+'include' => [
+    base_path(),   // = D:\fz\0601-2\solo-dogfeeding\code\12-InvoiceShelf
+],
+```
+
+而临时打包目录的配置 [config/backup.php#L173](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L173)：
+
+```php
+'temporary_directory' => storage_path('app/backup-temp'),
+// = D:\fz\0601-2\solo-dogfeeding\code\12-InvoiceShelf\storage\app\backup-temp
+```
+
+注意：`storage_path()` 展开后是 `base_path() . '/storage/...'`，也就是说 **temporary_directory 是 include 目录的子目录**。
+
+#### 4.3.2 如果不排除会发生什么 — ZIP 递归膨胀路径
+
+假设临时目录不被排除，BackupJob 的执行时序如下：
+
+```
+时间 t=0:
+  include: base_path()  ← 整个项目根
+  exclude: vendor, node_modules, .git  ← 无 temporary_directory
+
+时间 t=1: BackupJob 开始收集文件
+  遍历 base_path() 下所有文件和子目录
+    ↓
+  进入 storage/
+    ↓
+  进入 storage/app/
+    ↓
+  进入 storage/app/backup-temp/   ← 注意：这个目录此时是空的，还没创建 ZIP
+    ↓
+  没问题，backup-temp 是空目录，跳过
+
+时间 t=2: 收集完文件后开始写 ZIP
+  在 storage/app/backup-temp/ 下创建：
+    2024-06-17-15-30-00.zip  ← 正在写入，大小从 0 开始增长
+
+时间 t=3: 问题来了 —— spatie 的 FileSelection 是流式遍历
+  某些场景下（第二次遍历、或 include 路径包含 backup-temp 的绝对路径）
+  会再次扫描到 backup-temp/ 目录
+    ↓
+  发现 2024-06-17-15-30-00.zip 这个文件
+    ↓
+  把这个 ZIP 文件当作普通文件，打包进 ZIP 文件自身！
+
+时间 t=4: 递归膨胀
+  ZIP 正在写入的大小 = 已收集文件 + 这个 ZIP 自身的当前大小
+    ↓
+  每次 ZIP 增长一点，自身就多包含一点
+    ↓
+  大小指数级膨胀：1MB → 2MB → 4MB → 8MB → 16MB ...
+    ↓
+  直到：磁盘满 / PHP 内存耗尽 / 超时强制终止 / ZipArchive 报错
+```
+
+**这不是理论问题**。早期版本的 spatie/backup 就出过这个 bug — 项目包含自身目录时 ZIP 无限膨胀。正因为如此，spatie 现在在代码层面硬编码了 temporary_directory 的自动排除。
+
+#### 4.3.3 include / exclude / 自动排除的优先级
+
+spatie/laravel-backup v10 的 `FileSelection` 类中，三类排除项的**处理顺序**（优先级从低到高）：
+
+```
+优先级 1（最容易被覆盖）: 用户配置的 include
+          ↓
+优先级 2: 用户配置的 exclude  [config/backup.php#L37-L41]
+          ← vendor / node_modules / .git
+          ↓
+优先级 3（最强，无法覆盖）: spatie 自动追加的 exclude
+          ← temporary_directory
+          ← 目标磁盘上已有的备份文件路径（防重复打包）
+```
+
+即使用户把 `storage/app/backup-temp` 手动加到 `include` 里也没用 — 优先级 3 的自动排除会强制把它从最终列表中剔除。
+
+配置注释也明确说明了这一点 [config/backup.php#L35-L36](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L35-L36)：
+
+> Directories used by the backup process will automatically be excluded.
+
+#### 4.3.4 实际排除链路
+
+```
+BackupJob::run()
+  → FileSelection::create()
+    → 加载 config('backup.backup.source.files.include')
+    → 加载 config('backup.backup.source.files.exclude')
+    → 追加 temporary_directory 到 exclude
+    → 追加 destination disks 的备份目录路径到 exclude
+  → FileSelection 通过 Symfony Finder 遍历
+    → Finder::exclude() 应用目录排除规则
+    → 每个文件判断是否在排除路径下，是则跳过
+  → 收集通过的文件列表
+  → Zip::create() 写入 temporary_directory
+  → 写入完成后，把 ZIP 从 temporary_directory 移动到目标磁盘
+  → 删除 temporary_directory 中的残留文件
+```
+
+#### 4.3.5 三层防护总结
+
+| 层 | 机制 | 代码位置 | 防护 |
+|----|------|---------|------|
+| 1 | spatie 自动排除 `temporary_directory` | BackupJob → FileSelection（spatie 源码硬编码） | 正在写入的 ZIP 不会被重新打包 |
+| 2 | spatie 自动排除目标磁盘的备份目录 | BackupJob → FileSelection（spatie 源码硬编码） | 已有的旧备份 ZIP 不会被重新打包 |
+| 3 | 用户配置排除 vendor/node_modules/.git | [config/backup.php#L37-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php#L37-L41) | 大型依赖目录不会被包含 |
+
+> **最终保证**：无论如何配置，第 1 层的自动排除是硬编码在 spatie/backup v10 源码中的，无法关闭。即使用户想递归也做不到。
+
+---
+
+### 4.4 备份任务信号开关与 Queue Worker 设计
+
+**核心代码** [CreateBackupJob.php#L39-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Jobs/CreateBackupJob.php#L39-L41)：
+
+```php
+if (! defined('SIGINT')) {
+    $backupJob->disableSignals();
+}
+```
+
+这段三行代码解决了**两层冲突问题**。下面逐层拆解。
+
+#### 4.4.1 第一层冲突：spatie 信号处理器 vs Laravel Queue Worker 信号处理器
+
+**spatie/backup 为什么要注册信号？**
+
+spatie/laravel-backup v10 依赖 `spatie/laravel-signal-aware-command ^2.1`（实际版本 v2.1.2 [composer.lock#L5544-L5548](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/composer.lock#L5544-L5548)）。
+
+这个包的设计目标是：在 **`php artisan backup:run` 命令行直接执行**时，处理 Ctrl+C（SIGINT）和 `kill`（SIGTERM），做到优雅中断：
+
+```
+用户在终端按 Ctrl+C
+  → 系统向 artisan 进程发 SIGINT
+  → signal-aware-command 的处理器被触发
+  → BackupJob 收到信号
+  → 停止收集文件，关闭 ZipArchive
+  → 清理 temporary_directory 中的半写文件
+  → 正常退出，返回非 0 状态码
+  → 触发 BackupHasFailedNotification
+```
+
+这在命令行下是正确的行为。
+
+**问题出在 queue worker 场景**：
+
+当备份任务通过 `dispatch(new CreateBackupJob())` 投递给队列后，执行环境变了：
+
+```
+php artisan queue:work database
+  → queue worker 启动，常驻内存
+  → worker 自己用 pcntl_signal() 注册了 SIGINT / SIGTERM / SIGALRM 处理器
+      • SIGINT / SIGTERM: 响应 queue:restart、queue:pause
+      • SIGALRM:          实现 retry_after 超时机制
+  → worker 取出 CreateBackupJob
+  → 执行 handle()
+  → BackupJobFactory::createFromConfig()
+  → 如果不 disableSignals()，spatie 会再次调用 pcntl_signal()
+      ↓
+  此时发生：后注册的信号处理器 **覆盖** 先注册的
+  ↓
+  worker 原有的 SIGINT / SIGTERM 处理器被 BackupJob 的处理器替换！
+```
+
+**替换后的后果（极其严重）**：
+
+| 操作 | 正常情况（worker 自己处理） | 冲突后（BackupJob 覆盖） |
+|------|--------------------------|------------------------|
+| `php artisan queue:restart` | worker 保存当前 Job 状态，释放回队列，然后退出 | BackupJob 的处理器收到 SIGINT，认为是"中断备份"，清理临时文件，Job 失败 |
+| Worker 超时（retry_after=90s） | Worker 释放 Job，标记为可重试 | 超时由 SIGALRM 触发，BackupJob 没处理 → Worker 的 SIGALRM 被覆盖 → 超时失效，任务永远卡死 |
+| 正常备份完成 | BackupJob 结束，Worker 取下一个 Job | 无问题 |
+
+这就是为什么 `disableSignals()` 必须在 queue worker 场景下被调用。
+
+#### 4.4.2 第二层冲突：跨平台差异
+
+PHP 的 POSIX 信号（`pcntl_signal`、`SIGINT` 常量）只在**满足以下全部条件**时可用：
+
+1. 操作系统是 Unix/Linux/macOS（不是 Windows）
+2. PHP 编译时启用了 `--enable-pcntl`（CLI 模式一般默认启用，FPM 模式禁用）
+3. 运行方式是 CLI（不是 FPM / mod_php）
+
+在 **Windows** 环境下：
+- `pcntl` 扩展根本不存在
+- `SIGINT`、`SIGTERM` 常量**未定义**
+- 如果 spatie/backup 内部执行类似 `if ($signal === SIGINT)` 的比较，会直接抛出 `Undefined constant SIGINT` 的 Fatal Error
+
+所以代码用了 `defined('SIGINT')` 做判断，而不是判断操作系统或扩展是否存在。`defined()` 是最准确的判断方式 —— 因为即使在 Linux 上，如果 PHP 没启用 pcntl，`SIGINT` 同样未定义。
+
+#### 4.4.3 判断逻辑的真实含义
+
+```php
+if (! defined('SIGINT')) {          // 信号常量不存在？
+    $backupJob->disableSignals();   // 是 → 禁用 spatie 的信号注册
+}
+```
+
+完整的决策表：
+
+| 环境 | `SIGINT` 定义？ | `disableSignals()` 调用？ | 实际行为 |
+|------|----------------|-------------------------|---------|
+| Linux/macOS CLI + pcntl | 已定义 | **不调用** | BackupJob 注册自己的信号处理器；**注意 — 仍可能与 Worker 冲突**（见下方说明） |
+| Linux CLI 无 pcntl | 未定义 | 调用 | BackupJob 不注册信号，Worker 自己处理 |
+| Windows CLI | 未定义 | 调用 | BackupJob 不注册信号，Worker 用超时机制终止 |
+| `sync` 队列（同步） | Linux=是 Windows=否 | 同上 | sync 无 Worker，spatie 信号正常工作 / 不注册 |
+
+#### 4.4.4 残留问题：Linux 下信号冲突仍然可能发生
+
+注意代码只判断了 `defined('SIGINT')`，**没有判断当前是否在 queue worker 中执行**。这意味着：
+
+**Linux + pcntl + database/redis 队列**的场景下，即使运行在 queue worker 中，`SIGINT` 也是定义的，`disableSignals()` **不会被调用**，spatie 的信号处理器还是会注册，可能覆盖 Worker 的处理器。
+
+这是一个**潜在的设计缺陷**，但实际影响较小，原因是：
+
+1. **InvoiceShelf 默认队列是 `sync`** [config/queue.php#L16](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/queue.php#L16)：`env('QUEUE_CONNECTION', 'sync')`
+   - `sync` 模式下，dispatch 后同步执行，没有独立的 worker 进程
+   - spatie 注册信号处理器是正确的行为
+
+2. 如果运维切换到 `database`/`redis` 异步队列：
+   - 风险真实存在：`queue:restart` 可能被 BackupJob 的信号处理器当成"中断备份"
+   - 但备份成功/失败有通知（见第六章），运维能感知到异常
+   - 要彻底修复，应改为判断 `! $this->job`（即 Job 不是通过队列执行），或者直接永远 `disableSignals()`，交给 Worker 统一处理
+
+> **设计权衡**：当前写法是"能用就用，不能用就禁"的保守策略 — 在支持信号的环境下尽量给备份优雅中断的能力，代价是异步队列场景下有潜在冲突。这个权衡成立的前提是项目默认用 `sync` 队列。
+
+#### 4.4.5 两种中断方式的对比
+
+| 中断方式 | 触发条件 | 谁来清理临时文件 | Job 最终状态 |
+|---------|---------|----------------|------------|
+| spatie 优雅中断 | Linux + 信号可用 + 收到 SIGINT/SIGTERM | BackupJob 的信号处理器主动删除 temporary_directory | `BackupHasFailed`，有通知 |
+| Worker 超时终止 | 运行超过 `retry_after`（默认 90s [config/queue.php#L42](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/queue.php#L42)） | Worker 释放 Job，临时文件**可能残留** | Job 被放回队列，可重试；仍失败则写入 `failed_jobs` 表 |
+
+**残留临时文件的风险**：两种方式都不会造成功能性问题 — 下一次备份执行时会重新创建 `temporary_directory`，旧的残留文件会被覆盖或被 `backup:clean` 清理任务处理。
 
 ---
 
@@ -891,8 +1127,12 @@ if ($mediaCount > 0) {
 | 文件磁盘服务 | [FileDiskService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Services/Storage/FileDiskService.php) |
 | 磁盘控制器 | [DiskController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Controllers/Admin/Settings/DiskController.php) |
 | 表单验证 | [DiskEnvironmentRequest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Http/Requests/DiskEnvironmentRequest.php) |
-| SSRF 防护 | [PrivateNetworkGuard.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php) |
+| SSRF 守卫 | [PrivateNetworkGuard.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/PrivateNetworkGuard.php) |
+| SSRF 异常 | [BlockedUrlException.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Net/BlockedUrlException.php) |
 | URL 验证规则 | [PublicHttpUrl.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/PublicHttpUrl.php) |
+| AI 出站驱动 | [OpenRouterDriver.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Ai/OpenRouterDriver.php) |
+| PDF 出站驱动 | [GotenbergPdfDriver.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/Pdf/GotenbergPdfDriver.php) |
+| 汇率出站驱动 | [CurrencyConverterDriver.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Support/ExchangeRate/CurrencyConverterDriver.php) |
 | 验证规则 | [PathToZip.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/PathToZip.php), [BackupDisk.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/app/Rules/Backup/BackupDisk.php) |
 | 调度配置 | [console.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/routes/console.php) |
 | 备份配置 | [config/backup.php](file:///d:/fz/0601-2/solo-dogfeeding/code/12-InvoiceShelf/config/backup.php) |
